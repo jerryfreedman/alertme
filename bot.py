@@ -1,8 +1,7 @@
 import os
 import json
 import logging
-import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -15,221 +14,252 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Config ---
+# ─── Config ───────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])  # Your Telegram chat ID — bot ignores everyone else
-DAILY_BRIEFING_HOUR = int(os.environ.get("DAILY_BRIEFING_HOUR", "7"))  # 7am default
+ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
+DAILY_BRIEFING_HOUR = int(os.environ.get("DAILY_BRIEFING_HOUR", "7"))
 EST = pytz.timezone("America/New_York")
 
-# --- Clients ---
+# ─── Clients ──────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- Conversation state for disambiguation ---
-pending_disambiguation = {}  # chat_id -> {choices: [...], original_message: str, field: str}
+# ─── Conversation State ────────────────────────
+# Tracks multi-turn intake sessions and disambiguation
+conversation_state = {}
+# Structure per chat_id:
+# {
+#   "mode": "intake" | "disambiguation" | None,
+#   "partial_entities": {},       # extracted so far
+#   "raw_message": str,           # original user message
+#   "questions": [],              # questions bot asked
+#   "answers": [],                # user's answers so far
+#   "account_context": str,       # existing DB context for this account
+#   "disambiguation_choices": [], # for disambiguation mode
+#   "disambiguation_field": str,
+# }
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM PROMPT
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are SalesFlow, a personal AI CRM assistant. You help manage accounts, contacts, opportunities, and interactions for an account manager.
+SYSTEM_PROMPT = """You are SalesFlow, a personal AI CRM assistant and intelligent account management partner. You actively help capture, structure, and surface sales intelligence — asking smart follow-up questions to ensure every interaction is fully documented.
 
-You have access to a Supabase database with these tables:
-- accounts: id, name, industry, website, size, notes, created_at, updated_at
-- contacts: id, first_name, last_name, email, phone, title, account_id, linkedin, notes, created_at, updated_at
-- opportunities: id, name, account_id, primary_contact_id, stage, value, currency, close_date, probability, notes, created_at, updated_at
+## Database Schema
+- accounts: id, name, industry, website, size, notes
+- contacts: id, first_name, last_name, email, phone, title, account_id, linkedin, notes
+- opportunities: id, name, account_id, primary_contact_id, stage, value, currency, close_date, probability, notes
   - stages: prospecting / qualified / proposal / negotiation / closed_won / closed_lost
-- interactions: id, type, raw_text, summary, next_steps, account_id, opportunity_id, contact_ids[], created_at
-  - types: call / email / meeting / note / voicenote
-- tasks: id, title, due_at, account_id, opportunity_id, contact_id, completed, created_at
+- interactions: id, type (call/email/meeting/note), raw_text, summary, next_steps, account_id, opportunity_id, contact_ids[]
+- tasks: id, title, due_at, account_id, opportunity_id, contact_id, completed
 
-You will receive the user's message and relevant database context. Respond in one of these structured JSON formats:
+## Your Core Behavior
+You are an active interviewer, not a passive recorder. When someone logs a call or meeting, you ALWAYS ask 2-3 smart follow-up questions to fill in missing deal intelligence. Your questions should be:
+- Specific to this account/deal based on existing DB context
+- Focused on the highest-value missing data (stage, value, blockers, next steps, timeline)
+- Conversational and brief — not a form
 
-## Intent: STORE
-User is logging new information (call notes, meeting notes, new contact, deal update, etc.)
+## Response Formats (always valid JSON, no markdown)
+
+### INTAKE — Use for ANY new interaction log (call, meeting, email, note)
+Extract what you can, then ask 2-3 targeted follow-up questions.
 {
-  "intent": "STORE",
-  "entities": {
+  "intent": "INTAKE",
+  "partial_entities": {
     "account_name": "string or null",
     "contact_first_name": "string or null",
     "contact_last_name": "string or null",
     "contact_title": "string or null",
-    "opportunity_name": "string or null",
+    "interaction_type": "call|email|meeting|note",
+    "interaction_summary": "string or null",
+    "next_steps": "string or null",
     "opportunity_stage": "string or null",
     "opportunity_value": number or null,
     "opportunity_close_date": "YYYY-MM-DD or null",
-    "interaction_type": "call|email|meeting|note",
-    "interaction_summary": "clean 1-2 sentence summary",
-    "next_steps": "string or null",
     "task_title": "string or null",
     "task_due_at": "ISO8601 or null"
   },
-  "confirmation": "Short friendly confirmation message to show user (1-2 lines, use ✓ emoji)",
-  "needs_disambiguation": false,
-  "disambiguation_field": null,
-  "disambiguation_choices": []
+  "intro": "Short friendly opener referencing what you heard (1 line)",
+  "questions": [
+    "Question 1 — most important missing field",
+    "Question 2 — second most important",
+    "Question 3 — optional, only if genuinely needed"
+  ]
 }
 
-## Intent: QUERY
-User is asking a question about their data.
+### STORE — Use ONLY when finalizing after intake answers, or if message already has complete info
+{
+  "intent": "STORE",
+  "entities": { ...same fields as partial_entities... },
+  "confirmation": "✓ Saved summary (2-3 lines max, use bullet points for key details)"
+}
+
+### QUERY — User asking a question about their data
 {
   "intent": "QUERY",
-  "query_type": "account|contact|opportunity|pipeline|task|general",
-  "search_terms": ["term1", "term2"],
-  "response": "Your full answer based on the provided database context. Be conversational and helpful."
+  "response": "Full answer based on DB context. Be specific, reference actual data."
 }
 
-## Intent: TASK
-User wants to set a reminder or follow-up.
+### TASK — Setting a reminder only (no interaction to log)
 {
   "intent": "TASK",
   "task_title": "string",
-  "task_due_at": "ISO8601 datetime or null",
+  "task_due_at": "ISO8601 or null",
   "account_name": "string or null",
-  "contact_name": "string or null",
-  "confirmation": "✓ Reminder set: [task] — [date]"
+  "confirmation": "✓ Reminder set: [task] — [date/time]"
 }
 
-## Intent: DRAFT
-User wants you to write an email or message.
+### DRAFT — Writing an email or message
 {
   "intent": "DRAFT",
-  "draft_type": "email|message",
   "subject": "string or null",
-  "body": "The full draft text",
-  "context_used": "Brief note on what context you pulled from"
+  "body": "Full draft text",
+  "context_used": "Brief note on context pulled"
 }
 
-## Intent: DISAMBIGUATE
-A name or entity is ambiguous and you need the user to clarify.
+### DISAMBIGUATE — Name/entity is ambiguous
 {
   "intent": "DISAMBIGUATE",
   "field": "contact|account|opportunity",
   "question": "Which [thing] do you mean?",
-  "choices": ["Option 1 description", "Option 2 description", "New contact/account"]
+  "choices": ["Option 1", "Option 2", "New"]
 }
 
-## Intent: GENERAL
-Any general question or conversation not related to CRM data.
+### GENERAL — General question or conversation
 {
   "intent": "GENERAL",
-  "response": "Your response as a helpful AI assistant."
+  "response": "Your helpful response."
 }
 
-Important rules:
-- Always respond with valid JSON only — no markdown, no explanation outside JSON
-- For STORE intents, extract as much structured data as possible
-- For QUERY intents, base your answer strictly on the provided database context
-- Be concise and friendly in confirmations and responses
-- Today's date is: """ + datetime.now(EST).strftime("%Y-%m-%d") + """
-- When dates are relative ("Friday", "next week", "end of month"), resolve them to actual dates
+## Smart Question Guidelines
+When writing INTAKE questions, use the DB context to be specific:
+- If account exists: reference what you already know ("You mentioned pricing was a concern last time — did that come up?")
+- If deal stage is unknown: ask ("Where does this deal sit — are they evaluating, or ready to move?")
+- If no value captured: ask ("Any budget or deal size mentioned?")
+- If no follow-up: ask ("What's the next step, and when should I remind you?")
+- If new contact: ask ("What's [name]'s role, and are they the decision maker?")
+
+Never ask about something already clearly stated. Max 3 questions. Keep them punchy.
+
+Today's date: """ + datetime.now(EST).strftime("%A, %B %d %Y") + """
 """
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # DATABASE HELPERS
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
-def get_crm_context(search_terms: list[str] = None) -> str:
-    """Pull relevant CRM data to give Claude context."""
+def get_crm_context(account_name: str = None) -> str:
+    """Pull CRM data. If account_name given, fetch deep context for that account."""
     try:
-        context_parts = []
+        parts = []
 
-        # Recent interactions (last 30)
-        interactions = supabase.table("interactions").select(
-            "*, accounts(name), opportunities(name, stage, value)"
-        ).order("created_at", desc=True).limit(30).execute()
+        if account_name:
+            # Deep dive on specific account
+            accs = supabase.table("accounts").select("*").ilike("name", f"%{account_name}%").execute()
+            if accs.data:
+                acc = accs.data[0]
+                parts.append(f"## Account: {acc['name']}")
+                parts.append(f"Industry: {acc.get('industry','')} | Notes: {acc.get('notes','')}")
 
-        if interactions.data:
-            context_parts.append("## Recent Interactions")
-            for i in interactions.data:
-                acc = i.get("accounts", {}) or {}
-                opp = i.get("opportunities", {}) or {}
-                context_parts.append(
-                    f"- [{i['created_at'][:10]}] {i.get('type','note').upper()} | "
-                    f"Account: {acc.get('name','?')} | "
-                    f"Opp: {opp.get('name','?')} | "
-                    f"Summary: {i.get('summary', i.get('raw_text',''))[:120]} | "
-                    f"Next: {i.get('next_steps','')}"
-                )
+                # Contacts at this account
+                contacts = supabase.table("contacts").select("*").eq("account_id", acc["id"]).execute()
+                if contacts.data:
+                    parts.append("\n### Contacts")
+                    for c in contacts.data:
+                        parts.append(f"- {c.get('first_name','')} {c.get('last_name','')} | {c.get('title','')} | {c.get('email','')}")
 
-        # All accounts
-        accounts = supabase.table("accounts").select("id, name, industry, notes").execute()
-        if accounts.data:
-            context_parts.append("\n## Accounts")
-            for a in accounts.data:
-                context_parts.append(f"- {a['name']} (ID: {a['id']}) | {a.get('industry','')} | {a.get('notes','')[:80]}")
+                # Open opportunities
+                opps = supabase.table("opportunities").select("*").eq("account_id", acc["id"]).execute()
+                if opps.data:
+                    parts.append("\n### Opportunities")
+                    for o in opps.data:
+                        parts.append(f"- {o.get('name','?')} | Stage: {o.get('stage','?')} | Value: ${o.get('value') or 0:,.0f} | Close: {o.get('close_date','?')}")
 
-        # All contacts
-        contacts = supabase.table("contacts").select(
-            "id, first_name, last_name, title, email, account_id, accounts(name)"
-        ).execute()
-        if contacts.data:
-            context_parts.append("\n## Contacts")
-            for c in contacts.data:
-                acc = c.get("accounts", {}) or {}
-                name = f"{c.get('first_name','')} {c.get('last_name','')}".strip()
-                context_parts.append(
-                    f"- {name} (ID: {c['id']}) | {c.get('title','')} @ {acc.get('name','')} | {c.get('email','')}"
-                )
+                # Interaction history
+                ints = supabase.table("interactions").select("*").eq("account_id", acc["id"]).order("created_at", desc=True).limit(15).execute()
+                if ints.data:
+                    parts.append("\n### Interaction History")
+                    for i in ints.data:
+                        parts.append(f"- [{i['created_at'][:10]}] {i.get('type','').upper()}: {i.get('summary', i.get('raw_text',''))[:100]} | Next: {i.get('next_steps','')[:60]}")
 
-        # Open opportunities
-        opps = supabase.table("opportunities").select(
-            "id, name, stage, value, close_date, probability, accounts(name), contacts(first_name, last_name)"
-        ).neq("stage", "closed_won").neq("stage", "closed_lost").execute()
-        if opps.data:
-            context_parts.append("\n## Open Opportunities")
-            for o in opps.data:
-                acc = o.get("accounts", {}) or {}
-                context_parts.append(
-                    f"- {o.get('name','?')} (ID: {o['id']}) | {acc.get('name','?')} | "
-                    f"Stage: {o.get('stage','?')} | Value: ${o.get('value',0):,.0f} | "
-                    f"Close: {o.get('close_date','?')} | Prob: {o.get('probability','?')}%"
-                )
+                # Pending tasks
+                tasks = supabase.table("tasks").select("*").eq("account_id", acc["id"]).eq("completed", False).execute()
+                if tasks.data:
+                    parts.append("\n### Pending Tasks")
+                    for t in tasks.data:
+                        parts.append(f"- {t['title']} | Due: {str(t.get('due_at',''))[:10]}")
 
-        # Pending tasks
-        tasks = supabase.table("tasks").select(
-            "id, title, due_at, accounts(name), contacts(first_name, last_name)"
-        ).eq("completed", False).order("due_at").limit(20).execute()
-        if tasks.data:
-            context_parts.append("\n## Pending Tasks")
-            for t in tasks.data:
-                acc = t.get("accounts", {}) or {}
-                context_parts.append(
-                    f"- {t['title']} | Due: {t.get('due_at','?')[:10] if t.get('due_at') else 'no date'} | "
-                    f"Account: {acc.get('name','')}"
-                )
+        else:
+            # General context: recent interactions + pipeline
+            interactions = supabase.table("interactions").select(
+                "*, accounts(name), opportunities(name, stage, value)"
+            ).order("created_at", desc=True).limit(25).execute()
+            if interactions.data:
+                parts.append("## Recent Interactions")
+                for i in interactions.data:
+                    acc = i.get("accounts") or {}
+                    parts.append(f"- [{i['created_at'][:10]}] {acc.get('name','?')} | {i.get('type','').upper()}: {i.get('summary', i.get('raw_text',''))[:100]}")
 
-        return "\n".join(context_parts) if context_parts else "No CRM data yet."
+            accounts = supabase.table("accounts").select("id, name, industry").execute()
+            if accounts.data:
+                parts.append("\n## Accounts")
+                for a in accounts.data:
+                    parts.append(f"- {a['name']} (ID: {a['id']})")
+
+            contacts = supabase.table("contacts").select(
+                "id, first_name, last_name, title, accounts(name)"
+            ).execute()
+            if contacts.data:
+                parts.append("\n## Contacts")
+                for c in contacts.data:
+                    acc = c.get("accounts") or {}
+                    parts.append(f"- {c.get('first_name','')} {c.get('last_name','')} | {c.get('title','')} @ {acc.get('name','')}")
+
+            opps = supabase.table("opportunities").select(
+                "id, name, stage, value, close_date, accounts(name)"
+            ).not_.in_("stage", ["closed_won", "closed_lost"]).execute()
+            if opps.data:
+                parts.append("\n## Open Pipeline")
+                for o in opps.data:
+                    acc = o.get("accounts") or {}
+                    parts.append(f"- {acc.get('name','?')} | {o.get('stage','?')} | ${o.get('value') or 0:,.0f} | Close: {o.get('close_date','?')}")
+
+            tasks = supabase.table("tasks").select(
+                "id, title, due_at, accounts(name)"
+            ).eq("completed", False).order("due_at").limit(15).execute()
+            if tasks.data:
+                parts.append("\n## Pending Tasks")
+                for t in tasks.data:
+                    acc = t.get("accounts") or {}
+                    parts.append(f"- {t['title']} | {acc.get('name','')} | Due: {str(t.get('due_at',''))[:10]}")
+
+        return "\n".join(parts) if parts else "No CRM data yet — this is your first entry!"
 
     except Exception as e:
-        logger.error(f"Error fetching CRM context: {e}")
-        return "Error fetching CRM data."
+        logger.error(f"CRM context error: {e}")
+        return "Could not fetch CRM data."
 
 
 def find_or_create_account(name: str) -> str | None:
-    """Find account by name (fuzzy) or create it. Returns account ID."""
     if not name:
         return None
     try:
-        # Try exact match first
-        result = supabase.table("accounts").select("id, name").ilike("name", name).execute()
+        result = supabase.table("accounts").select("id").ilike("name", name).execute()
         if result.data:
             return result.data[0]["id"]
-        # Create new
         new = supabase.table("accounts").insert({"name": name}).execute()
         return new.data[0]["id"] if new.data else None
     except Exception as e:
-        logger.error(f"Error finding/creating account: {e}")
+        logger.error(f"Account error: {e}")
         return None
 
 
 def find_or_create_contact(first: str, last: str, account_id: str = None, title: str = None) -> str | None:
-    """Find contact by name or create them. Returns contact ID."""
     if not first and not last:
         return None
     try:
@@ -241,33 +271,28 @@ def find_or_create_contact(first: str, last: str, account_id: str = None, title:
         result = query.execute()
         if result.data:
             return result.data[0]["id"]
-        # Create new
-        payload = {
+        new = supabase.table("contacts").insert({
             "first_name": first or "",
             "last_name": last or "",
             "account_id": account_id,
             "title": title,
-        }
-        new = supabase.table("contacts").insert(payload).execute()
+        }).execute()
         return new.data[0]["id"] if new.data else None
     except Exception as e:
-        logger.error(f"Error finding/creating contact: {e}")
+        logger.error(f"Contact error: {e}")
         return None
 
 
-def find_or_create_opportunity(name: str, account_id: str, contact_id: str, entities: dict) -> str | None:
-    """Find open opportunity for account or create it. Returns opportunity ID."""
+def find_or_update_opportunity(account_id: str, contact_id: str, entities: dict) -> str | None:
     if not account_id:
         return None
     try:
-        # Find existing open opp for this account
         result = supabase.table("opportunities").select("id").eq(
             "account_id", account_id
         ).not_.in_("stage", ["closed_won", "closed_lost"]).execute()
 
         if result.data:
             opp_id = result.data[0]["id"]
-            # Update with new info
             update = {}
             if entities.get("opportunity_stage"):
                 update["stage"] = entities["opportunity_stage"]
@@ -279,24 +304,22 @@ def find_or_create_opportunity(name: str, account_id: str, contact_id: str, enti
                 supabase.table("opportunities").update(update).eq("id", opp_id).execute()
             return opp_id
 
-        # Create new
-        payload = {
-            "name": name or f"Opportunity",
+        new = supabase.table("opportunities").insert({
+            "name": f"{entities.get('account_name', 'Deal')} Opportunity",
             "account_id": account_id,
             "primary_contact_id": contact_id,
             "stage": entities.get("opportunity_stage", "prospecting"),
             "value": entities.get("opportunity_value"),
             "close_date": entities.get("opportunity_close_date"),
-        }
-        new = supabase.table("opportunities").insert(payload).execute()
+        }).execute()
         return new.data[0]["id"] if new.data else None
     except Exception as e:
-        logger.error(f"Error finding/creating opportunity: {e}")
+        logger.error(f"Opportunity error: {e}")
         return None
 
 
-def store_interaction(entities: dict, raw_text: str) -> bool:
-    """Save a new interaction and related entities to the database."""
+def store_complete_interaction(entities: dict, raw_text: str) -> bool:
+    """Save fully-formed interaction + related entities to Supabase."""
     try:
         account_id = find_or_create_account(entities.get("account_name"))
         contact_id = find_or_create_contact(
@@ -305,17 +328,9 @@ def store_interaction(entities: dict, raw_text: str) -> bool:
             account_id,
             entities.get("contact_title"),
         )
-        opportunity_id = None
-        if account_id:
-            opportunity_id = find_or_create_opportunity(
-                entities.get("opportunity_name"),
-                account_id,
-                contact_id,
-                entities,
-            )
+        opportunity_id = find_or_update_opportunity(account_id, contact_id, entities)
 
-        # Save interaction
-        interaction_payload = {
+        supabase.table("interactions").insert({
             "type": entities.get("interaction_type", "note"),
             "raw_text": raw_text,
             "summary": entities.get("interaction_summary", ""),
@@ -323,105 +338,90 @@ def store_interaction(entities: dict, raw_text: str) -> bool:
             "account_id": account_id,
             "opportunity_id": opportunity_id,
             "contact_ids": [contact_id] if contact_id else [],
-        }
-        supabase.table("interactions").insert(interaction_payload).execute()
+        }).execute()
 
-        # Save task if present
         if entities.get("task_title"):
-            task_payload = {
+            supabase.table("tasks").insert({
                 "title": entities["task_title"],
                 "due_at": entities.get("task_due_at"),
                 "account_id": account_id,
                 "opportunity_id": opportunity_id,
                 "contact_id": contact_id,
-            }
-            supabase.table("tasks").insert(task_payload).execute()
+            }).execute()
 
         return True
     except Exception as e:
-        logger.error(f"Error storing interaction: {e}")
+        logger.error(f"Store error: {e}")
         return False
 
 
-def store_task(task_title: str, task_due_at: str, account_name: str = None, contact_name: str = None) -> bool:
-    """Save a standalone task/reminder."""
-    try:
-        account_id = find_or_create_account(account_name) if account_name else None
-        payload = {
-            "title": task_title,
-            "due_at": task_due_at,
-            "account_id": account_id,
-        }
-        supabase.table("tasks").insert(payload).execute()
-        return True
-    except Exception as e:
-        logger.error(f"Error storing task: {e}")
-        return False
-
-
-# ─────────────────────────────────────────────
-# CLAUDE INTEGRATION
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CLAUDE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def ask_claude(user_message: str, db_context: str) -> dict:
-    """Send message to Claude with CRM context. Returns parsed JSON response."""
     try:
         response = claude.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=1024,
+            max_tokens=1500,
             system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"## Database Context\n{db_context}\n\n## User Message\n{user_message}"
-                }
-            ]
+            messages=[{
+                "role": "user",
+                "content": f"## Database Context\n{db_context}\n\n## User Message\n{user_message}"
+            }]
         )
         raw = response.content[0].text.strip()
-        # Strip markdown code fences if present
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
         return json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.error(f"Claude returned invalid JSON: {e}")
-        return {"intent": "GENERAL", "response": "Sorry, I had trouble processing that. Can you rephrase?"}
+    except json.JSONDecodeError:
+        logger.error("Claude returned invalid JSON")
+        return {"intent": "GENERAL", "response": "Sorry, I had trouble processing that. Try rephrasing?"}
     except Exception as e:
-        logger.error(f"Claude API error: {e}")
-        return {"intent": "GENERAL", "response": "I'm having trouble connecting right now. Try again in a moment."}
+        logger.error(f"Claude error: {e}")
+        return {"intent": "GENERAL", "response": "Having trouble connecting right now. Try again in a moment."}
 
 
-# ─────────────────────────────────────────────
+def format_intake_message(intro: str, questions: list[str]) -> str:
+    """Format the intake questions into a clean Telegram message."""
+    lines = [intro, ""]
+    for i, q in enumerate(questions, 1):
+        lines.append(f"*{i}.* {q}")
+    lines.append("")
+    lines.append("_Answer all at once or skip any with 'n/a'_")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DAILY BRIEFING
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def send_daily_briefing(app: Application):
-    """Generate and send the morning briefing."""
     try:
         db_context = get_crm_context()
-        briefing_prompt = (
+        result = ask_claude(
             "Generate a daily morning briefing. Include: "
             "1) Tasks due today or overdue, "
-            "2) Deals with no activity in 14+ days (check interactions), "
-            "3) Pipeline summary (total open deals + total value). "
-            "Format it cleanly with emojis. Keep it under 20 lines."
+            "2) Deals with no activity in 14+ days, "
+            "3) Pipeline summary (open deals + total value). "
+            "Format cleanly with emojis. Under 20 lines.",
+            db_context
         )
-        result = ask_claude(briefing_prompt, db_context)
         text = result.get("response", "Good morning! No briefing data available.")
-
         await app.bot.send_message(
             chat_id=ALLOWED_CHAT_ID,
-            text=f"☀️ *Good morning! Here's your daily briefing*\n\n{text}",
+            text=f"☀️ *Good morning! Daily Briefing*\n\n{text}",
             parse_mode="Markdown"
         )
     except Exception as e:
         logger.error(f"Briefing error: {e}")
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM HANDLERS
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ALLOWED_CHAT_ID:
@@ -429,132 +429,222 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *SalesFlow is live!*\n\n"
         "Just talk to me naturally:\n\n"
-        "• *Log a call:* \"Just got off with Sarah at Acme, 80k budget, Q3 close\"\n"
+        "• *Log a call:* \"Just got off with Sarah at Acme\"\n"
+        "• *I'll ask follow-up questions* to capture everything\n"
         "• *Query:* \"What's the status of Acme?\"\n"
         "• *Remind:* \"Remind me to follow up with John on Friday\"\n"
-        "• *Draft:* \"Draft a follow-up email to Sarah about the proposal\"\n"
+        "• *Draft:* \"Draft a follow-up email to Sarah\"\n"
         "• *Pipeline:* \"Show me my open deals\"\n\n"
-        "I'll remember everything. 🧠",
+        "The more you use me, the smarter I get about your deals. 🧠",
         parse_mode="Markdown"
     )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
-    # Security: only respond to your chat ID
     if chat_id != ALLOWED_CHAT_ID:
-        logger.warning(f"Rejected message from unauthorized chat_id: {chat_id}")
         return
 
     user_text = update.message.text.strip()
+    state = conversation_state.get(chat_id, {})
+    mode = state.get("mode")
 
-    # Handle disambiguation response (numbered choice)
-    if chat_id in pending_disambiguation and user_text.isdigit():
-        await handle_disambiguation_choice(update, context, int(user_text))
-        return
-
-    # Show typing indicator
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    # Get DB context and ask Claude
-    db_context = get_crm_context()
+    # ── INTAKE MODE: user is answering follow-up questions ──────────────────
+    if mode == "intake":
+        await handle_intake_answer(update, context, user_text, state)
+        return
+
+    # ── DISAMBIGUATION MODE: user picked a numbered option ──────────────────
+    if mode == "disambiguation" and user_text.isdigit():
+        await handle_disambiguation_choice(update, context, int(user_text), state)
+        return
+
+    # ── FRESH MESSAGE ────────────────────────────────────────────────────────
+    # Get relevant context — if account name is detectable, go deep on it
+    account_hint = extract_account_hint(user_text)
+    db_context = get_crm_context(account_name=account_hint)
+
     result = ask_claude(user_text, db_context)
     intent = result.get("intent", "GENERAL")
 
-    if intent == "STORE":
-        entities = result.get("entities", {})
+    if intent == "INTAKE":
+        # Save partial state and ask follow-up questions
+        conversation_state[chat_id] = {
+            "mode": "intake",
+            "partial_entities": result.get("partial_entities", {}),
+            "raw_message": user_text,
+            "questions": result.get("questions", []),
+            "answers": [],
+            "account_context": db_context,
+        }
+        msg = format_intake_message(
+            result.get("intro", "Got it — a couple quick questions:"),
+            result.get("questions", [])
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
-        # Check if disambiguation needed
-        if result.get("needs_disambiguation"):
-            pending_disambiguation[chat_id] = {
-                "choices": result.get("disambiguation_choices", []),
-                "original_message": user_text,
-                "entities": entities,
-                "field": result.get("disambiguation_field")
-            }
-            choices_text = "\n".join(
-                f"{i+1}. {c}" for i, c in enumerate(result["disambiguation_choices"])
-            )
-            await update.message.reply_text(
-                f"{result.get('confirmation', 'Which one do you mean?')}\n\n{choices_text}"
-            )
-            return
-
-        success = store_interaction(entities, user_text)
-        msg = result.get("confirmation", "✓ Got it, saved.")
+    elif intent == "STORE":
+        # Direct store (Claude decided no questions needed)
+        success = store_complete_interaction(result.get("entities", {}), user_text)
+        conversation_state.pop(chat_id, None)
+        msg = result.get("confirmation", "✓ Saved.")
         if not success:
-            msg = "⚠️ Had trouble saving that — please try again."
-        await update.message.reply_text(msg)
+            msg = "⚠️ Had trouble saving — please try again."
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
     elif intent == "DISAMBIGUATE":
-        pending_disambiguation[chat_id] = {
-            "choices": result.get("choices", []),
+        conversation_state[chat_id] = {
+            "mode": "disambiguation",
             "original_message": user_text,
-            "field": result.get("field")
+            "disambiguation_choices": result.get("choices", []),
+            "disambiguation_field": result.get("field"),
         }
-        choices_text = "\n".join(
-            f"{i+1}. {c}" for i, c in enumerate(result.get("choices", []))
-        )
+        choices_text = "\n".join(f"{i+1}. {c}" for i, c in enumerate(result.get("choices", [])))
         await update.message.reply_text(
-            f"{result.get('question', 'Which one?')}\n\n{choices_text}"
+            f"{result.get('question', 'Which one?')}\n\n{choices_text}",
+            parse_mode="Markdown"
         )
 
     elif intent == "QUERY":
-        await update.message.reply_text(result.get("response", "No data found."))
+        await update.message.reply_text(result.get("response", "No data found."), parse_mode="Markdown")
 
     elif intent == "TASK":
-        store_task(
-            result.get("task_title", "Follow up"),
-            result.get("task_due_at"),
-            result.get("account_name"),
-            result.get("contact_name"),
-        )
-        await update.message.reply_text(result.get("confirmation", "✓ Reminder saved."))
+        try:
+            account_id = find_or_create_account(result.get("account_name")) if result.get("account_name") else None
+            supabase.table("tasks").insert({
+                "title": result.get("task_title", "Follow up"),
+                "due_at": result.get("task_due_at"),
+                "account_id": account_id,
+            }).execute()
+        except Exception as e:
+            logger.error(f"Task save error: {e}")
+        await update.message.reply_text(result.get("confirmation", "✓ Reminder saved."), parse_mode="Markdown")
 
     elif intent == "DRAFT":
         subject = result.get("subject", "")
         body = result.get("body", "")
         header = f"*Subject: {subject}*\n\n" if subject else ""
-        await update.message.reply_text(
-            f"📧 *Draft*\n\n{header}{body}",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"📧 *Draft*\n\n{header}{body}", parse_mode="Markdown")
 
     else:  # GENERAL
-        await update.message.reply_text(result.get("response", "I'm not sure how to help with that."))
+        await update.message.reply_text(result.get("response", "I'm not sure how to help with that."), parse_mode="Markdown")
 
 
-async def handle_disambiguation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, choice: int):
-    """User picked a numbered option from a disambiguation prompt."""
+async def handle_intake_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, state: dict):
+    """Process user's answers to intake questions, then finalize the store."""
     chat_id = update.effective_chat.id
-    state = pending_disambiguation.pop(chat_id, None)
-    if not state:
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    # Check for cancel
+    if user_text.lower() in ["cancel", "stop", "nevermind", "never mind"]:
+        conversation_state.pop(chat_id, None)
+        await update.message.reply_text("No problem — entry cancelled.")
         return
 
-    choices = state.get("choices", [])
+    # Build full context: original message + partial entities + questions + answers
+    original = state.get("raw_message", "")
+    partial = state.get("partial_entities", {})
+    questions = state.get("questions", [])
+    db_context = state.get("account_context", "")
+
+    synthesis_prompt = (
+        f"Original message: {original}\n\n"
+        f"Partial data already extracted: {json.dumps(partial)}\n\n"
+        f"Questions you asked: {json.dumps(questions)}\n\n"
+        f"User's answers: {user_text}\n\n"
+        "Now synthesize all of this into a complete STORE response. "
+        "Fill in as many fields as possible from both the original message and the answers. "
+        "If the user said 'n/a' or 'skip' for something, leave that field null. "
+        "Write a confirmation that summarizes the key captured details."
+    )
+
+    result = ask_claude(synthesis_prompt, db_context)
+
+    # Force to STORE if Claude returned something else
+    if result.get("intent") == "INTAKE":
+        # Claude wants to ask more questions — allow one more round
+        conversation_state[chat_id] = {
+            **state,
+            "partial_entities": result.get("partial_entities", partial),
+            "questions": result.get("questions", []),
+            "answers": state.get("answers", []) + [user_text],
+        }
+        msg = format_intake_message(
+            result.get("intro", "Just a couple more:"),
+            result.get("questions", [])
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    entities = result.get("entities", partial)
+    raw_full = f"{original}\n\nFollow-up answers: {user_text}"
+    success = store_complete_interaction(entities, raw_full)
+    conversation_state.pop(chat_id, None)
+
+    if success:
+        await update.message.reply_text(
+            result.get("confirmation", "✓ Saved — all details captured."),
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("⚠️ Had trouble saving — please try again.")
+
+
+async def handle_disambiguation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, choice: int, state: dict):
+    """User picked a numbered option from disambiguation."""
+    chat_id = update.effective_chat.id
+    choices = state.get("disambiguation_choices", [])
+
     if choice < 1 or choice > len(choices):
-        await update.message.reply_text("Invalid choice. Please try again.")
+        await update.message.reply_text("Invalid choice — please try again.")
         return
 
     selected = choices[choice - 1]
-    await update.message.reply_text(f"Got it — using: {selected}\nRe-processing your note...")
+    conversation_state.pop(chat_id, None)
 
-    # Re-ask Claude with the disambiguation resolved
-    enriched = f"{state['original_message']} [Clarification: using {selected}]"
-    db_context = get_crm_context()
+    enriched = f"{state.get('original_message', '')} [Clarification: {selected}]"
+    account_hint = extract_account_hint(enriched)
+    db_context = get_crm_context(account_name=account_hint)
     result = ask_claude(enriched, db_context)
 
-    if result.get("intent") == "STORE":
-        store_interaction(result.get("entities", {}), enriched)
-        await update.message.reply_text(result.get("confirmation", "✓ Saved."))
+    if result.get("intent") == "INTAKE":
+        conversation_state[chat_id] = {
+            "mode": "intake",
+            "partial_entities": result.get("partial_entities", {}),
+            "raw_message": enriched,
+            "questions": result.get("questions", []),
+            "answers": [],
+            "account_context": db_context,
+        }
+        msg = format_intake_message(result.get("intro", "Got it:"), result.get("questions", []))
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    elif result.get("intent") == "STORE":
+        store_complete_interaction(result.get("entities", {}), enriched)
+        await update.message.reply_text(result.get("confirmation", "✓ Saved."), parse_mode="Markdown")
     else:
-        await update.message.reply_text(result.get("response", "Done."))
+        await update.message.reply_text(result.get("response", "Done."), parse_mode="Markdown")
 
 
-# ─────────────────────────────────────────────
+def extract_account_hint(text: str) -> str | None:
+    """Quick heuristic to pull a possible account name for targeted DB lookup."""
+    # Look for "at [Company]" or "with [Name] at [Company]" patterns
+    import re
+    patterns = [
+        r'\bat\s+([A-Z][a-zA-Z\s&]+?)(?:\s*[,\.\-]|$)',
+        r'\bfrom\s+([A-Z][a-zA-Z\s&]+?)(?:\s*[,\.\-]|$)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -575,7 +665,7 @@ def main():
             replace_existing=True,
         )
         scheduler.start()
-        logger.info(f"SalesFlow bot started. Daily briefing at {DAILY_BRIEFING_HOUR}:00 EST.")
+        logger.info(f"SalesFlow started. Briefing at {DAILY_BRIEFING_HOUR}:00 EST.")
 
     app.post_init = post_init
     app.run_polling(allowed_updates=Update.ALL_TYPES)
