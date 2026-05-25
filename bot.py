@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
@@ -190,6 +191,14 @@ Use when the user mentions a specific future time + who they're meeting.
   "intent": "GENERAL",
   "response": "Your helpful response."
 }
+
+## Critical capability notes
+- You CAN and DO send Telegram push notifications — every message you send arrives as a push notification
+  on the user's phone. Never say you "can't send push notifications" or "can't notify directly".
+- /test sends a live test notification in 10 seconds so the user can verify notifications are working.
+- Scheduled alerts (task due, event pre-brief, stale deals) fire automatically via the scheduler.
+- If asked to "send a notification in X seconds/minutes", tell them to use /test for instant verification,
+  or to set a task/event and the scheduler will alert them at the right time.
 
 ## Smart Question Guidelines
 - Reference existing DB context: "You mentioned pricing was a concern last time — did that come up?"
@@ -1347,6 +1356,29 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, "\n".join(lines))
 
 
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/test — fire a live Telegram push notification in 10 seconds to verify alerts work."""
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    now_str = datetime.now(TZ).strftime("%I:%M:%S %p %Z")
+    await update.message.reply_text(
+        f"🔔 Test started at {now_str}\n"
+        "You'll get a push notification in *10 seconds* — make sure your Telegram notifications are on for this chat.",
+        parse_mode="Markdown"
+    )
+
+    async def _send_ping():
+        await asyncio.sleep(10)
+        fire_str = datetime.now(TZ).strftime("%I:%M:%S %p %Z")
+        await context.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            text=f"✅ *Push notification working!* ({fire_str})\n\nIf you saw a notification banner, your alerts are fully set up.",
+            parse_mode="Markdown"
+        )
+
+    asyncio.create_task(_send_ping())
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/cancel — clear any active intake or disambiguation state."""
     if update.effective_chat.id != ALLOWED_CHAT_ID:
@@ -2405,6 +2437,7 @@ async def handle_disambiguation_choice(update: Update, context: ContextTypes.DEF
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("pipeline", cmd_pipeline))
