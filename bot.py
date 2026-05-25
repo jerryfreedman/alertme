@@ -1170,7 +1170,6 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         supabase.table("tasks").update({"completed": True}).eq("id", task["id"]).execute()
-        alerted_task_ids.discard(task["id"])  # clear alert tracking
         await update.message.reply_text(f"✅ *Done:* {task['title']}", parse_mode="Markdown")
 
     except Exception as e:
