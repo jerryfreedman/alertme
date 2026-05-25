@@ -2,7 +2,7 @@ import os
 import re
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -26,6 +26,10 @@ EST = pytz.timezone("America/New_York")
 
 # Messages longer than this are treated as bulk pastes
 BULK_THRESHOLD = 500
+
+# In-memory set of task IDs already alerted this session (avoids duplicate pings)
+# Acceptable to reset on restart — worst case is one re-alert per task
+alerted_task_ids: set[str] = set()
 
 # ─── Clients ──────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -816,6 +820,74 @@ def extract_account_hint(text: str) -> str | None:
 # SLASH COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/done [keyword] — mark a task complete by title keyword, or list tasks if no keyword given."""
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    keyword = " ".join(context.args).strip() if context.args else ""
+
+    try:
+        pending = supabase.table("tasks").select(
+            "id, title, due_at, accounts(name)"
+        ).eq("completed", False).order("due_at").execute()
+
+        if not pending.data:
+            await update.message.reply_text("✅ No pending tasks — nothing to mark done.")
+            return
+
+        if not keyword:
+            lines = ["Which task did you complete? Reply with the number:\n"]
+            for i, t in enumerate(pending.data[:10], 1):
+                acc = (t.get("accounts") or {}).get("name", "")
+                due_raw = t.get("due_at", "")
+                due_str = ""
+                if due_raw:
+                    try:
+                        dt = datetime.fromisoformat(due_raw.replace("Z", "+00:00")).astimezone(EST)
+                        due_str = f" | {dt.strftime('%b %d')}"
+                    except Exception:
+                        pass
+                line = f"*{i}.* {t['title']}"
+                if acc:
+                    line += f" — {acc}"
+                line += due_str
+                lines.append(line)
+            lines.append("\n_Or: /done [keyword] to match by title_")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            return
+
+        # Try keyword match first
+        if keyword.isdigit():
+            idx = int(keyword) - 1
+            if 0 <= idx < len(pending.data):
+                task = pending.data[idx]
+            else:
+                await update.message.reply_text(f"No task #{keyword} — run /done to see the list.")
+                return
+        else:
+            # Fuzzy title match
+            kw_lower = keyword.lower()
+            task = next(
+                (t for t in pending.data if kw_lower in t["title"].lower()),
+                None
+            )
+            if not task:
+                await update.message.reply_text(
+                    f'No pending task matching "{keyword}". Run /done to see the full list.'
+                )
+                return
+
+        supabase.table("tasks").update({"completed": True}).eq("id", task["id"]).execute()
+        alerted_task_ids.discard(task["id"])  # clear alert tracking
+        await update.message.reply_text(f"✅ *Done:* {task['title']}", parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"/done error: {e}")
+        await update.message.reply_text("Couldn't mark that task done — try again.")
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/cancel — clear any active intake or disambiguation state."""
     if update.effective_chat.id != ALLOWED_CHAT_ID:
@@ -947,24 +1019,231 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def send_daily_briefing(app: Application):
+    """
+    7am daily briefing — structured direct from Supabase, no Claude call needed.
+    Sections: overdue tasks → due today → closing this week → stale deals → pipeline total.
+    """
     try:
-        db_context = get_crm_context()
-        result = ask_claude(
-            "Generate a daily morning briefing. Include: "
-            "1) Tasks due today or overdue, "
-            "2) Deals with no activity in 14+ days, "
-            "3) Pipeline summary (open deals + total value). "
-            "Format cleanly with emojis. Under 20 lines.",
-            db_context
-        )
-        text = result.get("response", "Good morning! No briefing data available.")
+        now = datetime.now(EST)
+        today_iso = now.date().isoformat()
+        eod_iso = now.replace(hour=23, minute=59, second=59).isoformat()
+        seven_days_iso = (now + timedelta(days=7)).date().isoformat()
+        fourteen_days_ago_iso = (now - timedelta(days=14)).isoformat()
+
+        sections = [f"☀️ *Good morning — {now.strftime('%A, %B %d')}*\n"]
+
+        # ── 1. Overdue tasks ─────────────────────────────────────────────────
+        overdue = supabase.table("tasks").select(
+            "id, title, due_at, accounts(name)"
+        ).eq("completed", False).lt("due_at", now.isoformat()).order("due_at").execute()
+
+        if overdue.data:
+            sections.append(f"🔴 *Overdue ({len(overdue.data)}):*")
+            for t in overdue.data[:6]:
+                acc = (t.get("accounts") or {}).get("name", "")
+                try:
+                    dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+                    age = f"since {dt.strftime('%b %d')}"
+                except Exception:
+                    age = ""
+                line = f"  • {t['title']}"
+                if acc:
+                    line += f" — {acc}"
+                if age:
+                    line += f" _({age})_"
+                sections.append(line)
+
+        # ── 2. Due today ─────────────────────────────────────────────────────
+        due_today = supabase.table("tasks").select(
+            "id, title, due_at, accounts(name)"
+        ).eq("completed", False).gte("due_at", now.isoformat()).lte("due_at", eod_iso).order("due_at").execute()
+
+        if due_today.data:
+            sections.append(f"\n🟡 *Due Today ({len(due_today.data)}):*")
+            for t in due_today.data[:6]:
+                acc = (t.get("accounts") or {}).get("name", "")
+                time_str = ""
+                if t.get("due_at"):
+                    try:
+                        dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+                        time_str = f" at {dt.strftime('%I:%M %p')}"
+                    except Exception:
+                        pass
+                line = f"  • {t['title']}{time_str}"
+                if acc:
+                    line += f" — {acc}"
+                sections.append(line)
+
+        if not overdue.data and not due_today.data:
+            sections.append("✅ No tasks due today — clear calendar")
+
+        # ── 3. Deals closing within 7 days ───────────────────────────────────
+        closing = supabase.table("opportunities").select(
+            "name, stage, value, close_date, accounts(name)"
+        ).not_.in_("stage", ["closed_won", "closed_lost"]).gte(
+            "close_date", today_iso
+        ).lte("close_date", seven_days_iso).order("close_date").execute()
+
+        if closing.data:
+            sections.append(f"\n🗓 *Closing This Week ({len(closing.data)}):*")
+            for o in closing.data:
+                acc = (o.get("accounts") or {}).get("name", "?")
+                days_left = ""
+                if o.get("close_date"):
+                    try:
+                        d = (datetime.fromisoformat(o["close_date"]) - now.replace(tzinfo=None)).days + 1
+                        days_left = f" ({d}d)"
+                    except Exception:
+                        pass
+                val = f" | ${o.get('value'):,.0f}" if o.get("value") else ""
+                urgency = "🔴" if "1" in days_left or "2" in days_left else "🟡"
+                sections.append(f"  {urgency} {acc}{days_left}{val}")
+
+        # ── 4. Stale open deals (no interaction in 14+ days) ─────────────────
+        recent_interactions = supabase.table("interactions").select(
+            "account_id"
+        ).gte("created_at", fourteen_days_ago_iso).execute()
+        active_ids = {i["account_id"] for i in (recent_interactions.data or []) if i.get("account_id")}
+
+        stale = supabase.table("opportunities").select(
+            "account_id, stage, accounts(name)"
+        ).not_.in_("stage", ["closed_won", "closed_lost"]).execute()
+        stale_opps = [o for o in (stale.data or []) if o.get("account_id") not in active_ids]
+
+        if stale_opps:
+            sections.append(f"\n🕸 *Gone Quiet — 14+ days no activity ({len(stale_opps)}):*")
+            for o in stale_opps[:5]:
+                acc = (o.get("accounts") or {}).get("name", "?")
+                stage = (o.get("stage") or "").replace("_", " ").title()
+                sections.append(f"  • {acc} — {stage}")
+
+        # ── 5. Pipeline snapshot ─────────────────────────────────────────────
+        all_open = supabase.table("opportunities").select(
+            "value, probability"
+        ).not_.in_("stage", ["closed_won", "closed_lost"]).execute()
+
+        if all_open.data:
+            total = sum(o.get("value") or 0 for o in all_open.data)
+            weighted = sum(
+                (o.get("value") or 0) * ((o.get("probability") or 0) / 100)
+                for o in all_open.data
+            )
+            sections.append(
+                f"\n📊 *Pipeline:* {len(all_open.data)} open deals | "
+                f"${total:,.0f} total | ${weighted:,.0f} weighted"
+            )
+
+        msg = "\n".join(sections)
+        if len(msg) > 4000:
+            msg = msg[:3997] + "…"
+
+        await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Briefing error: {e}")
+        try:
+            await app.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text="⚠️ Daily briefing failed — check Railway logs."
+            )
+        except Exception:
+            pass
+
+
+async def check_due_tasks(app: Application):
+    """
+    Runs every 15 minutes. Sends an immediate Telegram alert for any task
+    due within the next 60 minutes, or overdue within the last 15 minutes.
+    Uses alerted_task_ids to avoid duplicate pings within a session.
+    """
+    try:
+        now = datetime.now(EST)
+        window_start = (now - timedelta(minutes=15)).isoformat()
+        window_end = (now + timedelta(minutes=60)).isoformat()
+
+        tasks = supabase.table("tasks").select(
+            "id, title, due_at, accounts(name)"
+        ).eq("completed", False).gte("due_at", window_start).lte("due_at", window_end).execute()
+
+        for t in (tasks.data or []):
+            tid = t["id"]
+            if tid in alerted_task_ids:
+                continue
+            alerted_task_ids.add(tid)
+
+            acc = (t.get("accounts") or {}).get("name", "")
+            try:
+                due_dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+                delta = (due_dt - now).total_seconds()
+                if delta < 0:
+                    timing = "🔴 *OVERDUE*"
+                elif delta < 3600:
+                    mins = max(1, int(delta / 60))
+                    timing = f"⏰ *Due in {mins} min*"
+                else:
+                    timing = f"⏰ *Due at {due_dt.strftime('%I:%M %p')}*"
+            except Exception:
+                timing = "⏰ *Due soon*"
+
+            lines = [f"{timing} — {t['title']}"]
+            if acc:
+                lines.append(f"Account: {acc}")
+
+            await app.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text="\n".join(lines),
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Due task check error: {e}")
+
+
+async def check_close_dates(app: Application):
+    """
+    Runs daily at 8am. Alerts on open deals whose close_date is within 7 days.
+    Skips if no deals are closing soon (silent if nothing to report).
+    """
+    try:
+        now = datetime.now(EST)
+        today_iso = now.date().isoformat()
+        seven_days_iso = (now + timedelta(days=7)).date().isoformat()
+
+        opps = supabase.table("opportunities").select(
+            "name, stage, value, close_date, accounts(name)"
+        ).not_.in_("stage", ["closed_won", "closed_lost"]).gte(
+            "close_date", today_iso
+        ).lte("close_date", seven_days_iso).order("close_date").execute()
+
+        if not opps.data:
+            return
+
+        lines = ["🗓 *Deals closing within 7 days:*\n"]
+        for o in opps.data:
+            acc = (o.get("accounts") or {}).get("name", "?")
+            stage = (o.get("stage") or "").replace("_", " ").title()
+            val = f"${o.get('value'):,.0f}" if o.get("value") else ""
+            days_left = ""
+            urgency = "🟡"
+            if o.get("close_date"):
+                try:
+                    d = (datetime.fromisoformat(o["close_date"]) - now.replace(tzinfo=None)).days + 1
+                    days_left = f"({d}d left)"
+                    if d <= 2:
+                        urgency = "🔴"
+                except Exception:
+                    pass
+            detail = " | ".join(filter(None, [stage, val, days_left]))
+            lines.append(f"{urgency} *{acc}* — {o.get('name', 'Deal')}")
+            if detail:
+                lines.append(f"   {detail}")
+
         await app.bot.send_message(
             chat_id=ALLOWED_CHAT_ID,
-            text=f"☀️ *Good morning! Daily Briefing*\n\n{text}",
+            text="\n".join(lines),
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Briefing error: {e}")
+        logger.error(f"Close date check error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1566,11 +1845,13 @@ def main():
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("pipeline", cmd_pipeline))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
+    app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler()
 
     async def post_init(application):
+        # 7am — full daily briefing
         scheduler.add_job(
             send_daily_briefing,
             "cron",
@@ -1581,8 +1862,31 @@ def main():
             id="daily_briefing",
             replace_existing=True,
         )
+        # 8am — deal close-date warnings (separate so they don't crowd the briefing)
+        scheduler.add_job(
+            check_close_dates,
+            "cron",
+            hour=DAILY_BRIEFING_HOUR,
+            minute=15,
+            timezone=EST,
+            args=[application],
+            id="close_date_check",
+            replace_existing=True,
+        )
+        # Every 15 minutes — live task due-date alerts
+        scheduler.add_job(
+            check_due_tasks,
+            "interval",
+            minutes=15,
+            args=[application],
+            id="task_due_check",
+            replace_existing=True,
+        )
         scheduler.start()
-        logger.info(f"SalesFlow started. Briefing at {DAILY_BRIEFING_HOUR}:00 EST.")
+        logger.info(
+            f"SalesFlow started. Daily briefing at {DAILY_BRIEFING_HOUR}:00 EST. "
+            "Task alerts every 15 min."
+        )
 
     app.post_init = post_init
     app.run_polling(allowed_updates=Update.ALL_TYPES)
