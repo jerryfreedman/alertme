@@ -22,8 +22,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 DAILY_BRIEFING_HOUR = int(os.environ.get("DAILY_BRIEFING_HOUR", "7"))
-# Configurable timezone — set USER_TIMEZONE env var to change (default: America/New_York)
-TZ = pytz.timezone(os.environ.get("USER_TIMEZONE", "America/New_York"))
+# All times are Eastern (handles EST/EDT automatically via DST)
+TZ = pytz.timezone("America/New_York")
 
 # Messages longer than this are treated as bulk pastes
 BULK_THRESHOLD = 500
@@ -201,10 +201,11 @@ Use when the user mentions a specific future time + who they're meeting.
 - Max 3 questions — keep them punchy
 - For BULK intent: extract everything you can; dedup is handled externally so don't add questions
 
-Today's date and time: """ + datetime.now(TZ).strftime("%A, %B %d %Y at %I:%M %p") + """
-User timezone: """ + str(TZ) + """ — ALL timestamps you generate (start_at, task_due_at, interaction_date)
-MUST include the UTC offset for this timezone. Example: "2024-01-16T14:00:00-05:00" for 2pm Eastern Standard
-Time or "2024-01-16T14:00:00-04:00" for 2pm Eastern Daylight Time. Never return a naive datetime (no offset).
+Today's date and time: """ + datetime.now(TZ).strftime("%A, %B %d %Y at %I:%M %p %Z") + """
+Timezone: Eastern Time (EST/EDT). ALL timestamps you generate MUST include the correct UTC offset.
+Current offset is """ + datetime.now(TZ).strftime("%z") + """ — use this exact offset for today's dates.
+Example format: "2024-01-16T14:00:00""" + datetime.now(TZ).strftime("%z")[:3] + """:00" = 2pm Eastern.
+Never return a naive datetime string without an offset.
 """
 
 
