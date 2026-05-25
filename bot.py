@@ -367,6 +367,103 @@ def check_for_duplicates(entities: dict, entity_index: int = 0) -> tuple[list[di
     return dedup_info, matches
 
 
+def get_bulk_field_questions(entity: dict, idx: int) -> list[dict]:
+    """
+    Generate questions for the most important missing fields in a bulk entity.
+    Returns at most 3 questions per entity, in priority order.
+    Each dict: {question, type="field", entity_index, field_name}
+    """
+    questions = []
+    acct = entity.get("account_name", f"Entry {idx + 1}")
+
+    if not entity.get("opportunity_stage"):
+        questions.append({
+            "question": f"[{acct}] Deal stage? (prospecting / qualified / proposal / negotiation / closed_won)",
+            "type": "field",
+            "entity_index": idx,
+            "field_name": "opportunity_stage",
+        })
+    if not entity.get("opportunity_value"):
+        questions.append({
+            "question": f"[{acct}] Any deal value or budget? (e.g. $50k — or n/a)",
+            "type": "field",
+            "entity_index": idx,
+            "field_name": "opportunity_value",
+        })
+    if not entity.get("next_steps"):
+        questions.append({
+            "question": f"[{acct}] Next step and timing? (or n/a)",
+            "type": "field",
+            "entity_index": idx,
+            "field_name": "next_steps",
+        })
+    contact_name = " ".join(filter(None, [
+        entity.get("contact_first_name"), entity.get("contact_last_name")
+    ]))
+    if contact_name and not entity.get("contact_title"):
+        questions.append({
+            "question": f"[{acct}] What's {contact_name}'s title/role? (or n/a)",
+            "type": "field",
+            "entity_index": idx,
+            "field_name": "contact_title",
+        })
+    return questions[:3]
+
+
+def apply_field_answer(entity: dict, field_name: str, answer: str) -> dict:
+    """
+    Apply a user's free-text answer to the right field in an entity dict.
+    Handles stage normalization, value parsing (50k → 50000), etc.
+    """
+    SKIP = {"n/a", "na", "skip", "none", "no", "unknown", "-", "not sure", "tbd", "?", ""}
+    clean = answer.strip()
+    if clean.lower() in SKIP:
+        return entity
+
+    if field_name == "opportunity_stage":
+        stage_map = [
+            ("prospect", "prospecting"),
+            ("qualify", "qualified"),
+            ("proposal", "proposal"),
+            ("prop", "proposal"),
+            ("negotiat", "negotiation"),
+            ("closed_won", "closed_won"),
+            ("closed won", "closed_won"),
+            ("won", "closed_won"),
+            ("win", "closed_won"),
+            ("closed_lost", "closed_lost"),
+            ("closed lost", "closed_lost"),
+            ("lost", "closed_lost"),
+        ]
+        lower = clean.lower()
+        matched = next((v for k, v in stage_map if k in lower), None)
+        entity["opportunity_stage"] = matched or lower
+
+    elif field_name == "opportunity_value":
+        nums = re.findall(r"[\d]+\.?\d*", clean.replace(",", ""))
+        if nums:
+            num = float(nums[0])
+            lower = clean.lower()
+            # Check for multiplier suffix — be careful not to match "meeting"
+            if re.search(r"\d\s*m(?:illion)?(?:\b|$)", lower):
+                num *= 1_000_000
+            elif re.search(r"\d\s*k(?:\b|$)", lower):
+                num *= 1_000
+            entity["opportunity_value"] = num
+
+    elif field_name == "next_steps":
+        entity["next_steps"] = clean
+        # Auto-create a task if the answer looks like an action item
+        action_words = ["follow up", "send", "call", "email", "schedule", "book", "prepare", "draft", "reach out"]
+        if any(w in clean.lower() for w in action_words) and not entity.get("task_title"):
+            entity["task_title"] = clean[:100]
+
+    elif field_name == "contact_title":
+        entity["contact_title"] = clean
+
+    return entity
+
+
 def resolve_dedup_answers(dedup_info: list[dict], raw_answers: list[str]) -> dict:
     """
     Given dedup question dicts and user's yes/no answers, return entity field overrides.
@@ -419,23 +516,45 @@ def find_or_create_account(name: str) -> str | None:
 
 
 def find_or_create_contact(first: str, last: str, account_id: str = None, title: str = None) -> str | None:
+    """
+    Find or create a contact, scoped to account_id when provided.
+    This prevents John Smith at Acme Corp from being linked to an interaction
+    at Globex Inc just because the names match.
+    """
     if not first and not last:
         return None
     try:
-        query = supabase.table("contacts").select("id")
-        if first:
-            query = query.ilike("first_name", first)
-        if last:
-            query = query.ilike("last_name", last)
-        result = query.execute()
-        if result.data:
-            return result.data[0]["id"]
-        new = supabase.table("contacts").insert({
+        # Prefer an exact name match within the same account
+        if account_id:
+            q = supabase.table("contacts").select("id")
+            if first:
+                q = q.ilike("first_name", first)
+            if last:
+                q = q.ilike("last_name", last)
+            scoped = q.eq("account_id", account_id).execute()
+            if scoped.data:
+                return scoped.data[0]["id"]
+
+        # Fall back to a global name match only if no account scoping applies
+        if not account_id:
+            q = supabase.table("contacts").select("id")
+            if first:
+                q = q.ilike("first_name", first)
+            if last:
+                q = q.ilike("last_name", last)
+            result = q.execute()
+            if result.data:
+                return result.data[0]["id"]
+
+        # Create new contact (linked to this account)
+        payload = {
             "first_name": first or "",
             "last_name": last or "",
             "account_id": account_id,
-            "title": title,
-        }).execute()
+        }
+        if title:
+            payload["title"] = title
+        new = supabase.table("contacts").insert(payload).execute()
         return new.data[0]["id"] if new.data else None
     except Exception as e:
         logger.error(f"Contact upsert error: {e}")
@@ -1083,22 +1202,26 @@ async def handle_bulk_paste(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
         return
 
-    # Run dedup on each entity, collect all dedup questions with entity_index
-    all_dedup_info = []
+    # ── Per-entity: dedup check + missing field questions ───────────────────
     resolved_entities = []
+    all_questions = []  # flat list of all question dicts (dedup + field), ordered
 
     for idx, entities in enumerate(entities_list):
         dedup_info, matches = check_for_duplicates(entities, entity_index=idx)
+
+        # Silent exact-match normalization
         if "account_exact" in matches:
             entities["account_name"] = matches["account_exact"]["name"]
         if "contact_exact" in matches:
             c = matches["contact_exact"]
             entities["contact_first_name"] = c["first_name"]
             entities["contact_last_name"] = c["last_name"]
-        resolved_entities.append(entities)
-        all_dedup_info.extend(dedup_info)
 
-    # Build preview
+        resolved_entities.append(entities)
+        all_questions.extend(dedup_info)                    # dedup first
+        all_questions.extend(get_bulk_field_questions(entities, idx))  # then fields
+
+    # ── Build the message ────────────────────────────────────────────────────
     lines = [f"📋 *Found {len(entities_list)} entries to import:*\n"]
     for i, e in enumerate(resolved_entities[:8], 1):
         acct = e.get("account_name", "Unknown Account")
@@ -1106,6 +1229,10 @@ async def handle_bulk_paste(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         itype = (e.get("interaction_type") or "note").capitalize()
         stage = e.get("opportunity_stage", "")
         val = f"${e.get('opportunity_value'):,.0f}" if e.get("opportunity_value") else ""
+        missing_flags = []
+        if not e.get("opportunity_stage"):   missing_flags.append("stage?")
+        if not e.get("opportunity_value"):   missing_flags.append("value?")
+        if not e.get("next_steps"):          missing_flags.append("next step?")
 
         line = f"*{i}.* {itype} — {acct}"
         if contact:
@@ -1113,41 +1240,58 @@ async def handle_bulk_paste(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         details = " | ".join(filter(None, [stage, val]))
         if details:
             line += f" | {details}"
+        if missing_flags:
+            line += f"  _[missing: {', '.join(missing_flags)}]_"
         lines.append(line)
 
     if len(resolved_entities) > 8:
         lines.append(f"_...and {len(resolved_entities) - 8} more_")
 
-    if all_dedup_info:
-        lines.append(f"\n⚠️ *{len(all_dedup_info)} duplicate check(s) needed before saving:*\n")
-        for i, d in enumerate(all_dedup_info, 1):
-            lines.append(f"*{i}.* {d['question']}")
-        lines.append("\n_Answer the checks above, then I'll save everything._")
-        lines.append("_Or type 'save all as new' to skip dedup and treat everything as new._")
+    if all_questions:
+        dedup_qs = [q for q in all_questions if q.get("type") != "field"]
+        field_qs = [q for q in all_questions if q.get("type") == "field"]
+
+        if dedup_qs:
+            lines.append(f"\n⚠️ *Duplicate checks ({len(dedup_qs)}):*")
+        if field_qs:
+            lines.append(f"\n📝 *Missing info ({len(field_qs)} questions):*")
+
+        lines.append("")
+        q_num = 1
+        for q in all_questions:
+            lines.append(f"*{q_num}.* {q['question']}")
+            q_num += 1
+
+        lines.append("")
+        lines.append("_Answer all by number. Type 'n/a' to skip any._")
+        lines.append("_Or type 'save all as new' to skip dedup checks only._")
 
         conversation_state[chat_id] = {
             "mode": "bulk_confirm",
             "bulk_entities": resolved_entities,
             "bulk_raw": user_text,
-            "bulk_dedup_info": all_dedup_info,
-            "bulk_dedup_pending": True,
+            "bulk_all_questions": all_questions,
+            "bulk_phase": "qa",
         }
     else:
-        lines.append(f"\n_No duplicates detected. Type *yes* to save all {len(resolved_entities)} entries, or *cancel* to abort._")
-
+        lines.append(f"\n✅ _All fields complete. Type *yes* to save {len(resolved_entities)} entries, or *cancel* to abort._")
         conversation_state[chat_id] = {
             "mode": "bulk_confirm",
             "bulk_entities": resolved_entities,
             "bulk_raw": user_text,
-            "bulk_dedup_info": [],
-            "bulk_dedup_pending": False,
+            "bulk_all_questions": [],
+            "bulk_phase": "confirm",
         }
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await safe_reply(update, "\n".join(lines))
 
 
 async def handle_bulk_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str, state: dict):
-    """Handle bulk mode — dedup resolution and final save confirmation."""
+    """
+    Two-phase bulk confirmation:
+    Phase 'qa'      — user answers dedup + missing-field questions
+    Phase 'confirm' — user types yes to save everything
+    """
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
@@ -1159,57 +1303,83 @@ async def handle_bulk_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     entities_list = state.get("bulk_entities", [])
-    bulk_dedup_info = state.get("bulk_dedup_info", [])
+    all_questions = state.get("bulk_all_questions", [])
+    phase = state.get("bulk_phase", "confirm")
 
-    # ── Dedup answer phase ───────────────────────────────────────────────────
-    if state.get("bulk_dedup_pending") and bulk_dedup_info:
-        if lower != "save all as new":
-            raw_answers = parse_numbered_answers(user_text)
-            if len(raw_answers) < 2:
-                raw_answers = [user_text]
+    # ── Phase 1: QA — resolve dedup + fill missing fields ───────────────────
+    if phase == "qa":
+        skip_dedup = lower == "save all as new"
+        raw_answers = parse_numbered_answers(user_text)
+        if len(raw_answers) < 2:
+            raw_answers = [user_text]
 
-            for j, info in enumerate(bulk_dedup_info):
-                if j >= len(raw_answers):
-                    break
-                answer = raw_answers[j].strip().lower()
-                eidx = info.get("entity_index", 0)
-                dtype = info.get("type", "")
+        for j, q_info in enumerate(all_questions):
+            answer = raw_answers[j].strip() if j < len(raw_answers) else ""
+            eidx = q_info.get("entity_index", 0)
+            qtype = q_info.get("type", "")
 
-                if dtype == "account" and answer in ("yes", "y"):
-                    entities_list[eidx]["account_name"] = info["existing_name"]
-
-                elif dtype == "account_multi" and answer not in ("new", "no", "n"):
-                    candidates = info.get("candidates", [])
+            if qtype == "field":
+                entities_list[eidx] = apply_field_answer(
+                    entities_list[eidx], q_info["field_name"], answer
+                )
+            elif not skip_dedup:
+                # Dedup resolution
+                ans_lower = answer.lower()
+                if qtype == "account" and ans_lower in ("yes", "y"):
+                    entities_list[eidx]["account_name"] = q_info["existing_name"]
+                elif qtype == "account_multi" and ans_lower not in ("new", "no", "n"):
+                    candidates = q_info.get("candidates", [])
                     matched = next(
-                        (c for c in candidates if c.lower() == answer),
-                        next((c for c in candidates if answer in c.lower()), None)
+                        (c for c in candidates if c.lower() == ans_lower),
+                        next((c for c in candidates if ans_lower in c.lower()), None)
                     )
                     if matched:
                         entities_list[eidx]["account_name"] = matched
-
-                elif dtype == "contact" and answer in ("yes", "y"):
-                    parts = info["existing_name"].split(" ", 1)
+                elif qtype == "contact" and ans_lower in ("yes", "y"):
+                    parts = q_info["existing_name"].split(" ", 1)
                     entities_list[eidx]["contact_first_name"] = parts[0]
                     entities_list[eidx]["contact_last_name"] = parts[1] if len(parts) > 1 else ""
 
         state["bulk_entities"] = entities_list
-        state["bulk_dedup_pending"] = False
+        state["bulk_phase"] = "confirm"
         conversation_state[chat_id] = state
 
-        await update.message.reply_text(
-            f"✓ Dedup resolved. Ready to save *{len(entities_list)} entries*.\n\n"
-            "Type *yes* to confirm, or *cancel* to abort.",
-            parse_mode="Markdown"
-        )
+        # Build final resolved summary for the user to review
+        summary_lines = [f"✅ *Resolved — here's what I'm about to save:*\n"]
+        for i, e in enumerate(entities_list[:10], 1):
+            acct = e.get("account_name", "Unknown")
+            contact = " ".join(filter(None, [e.get("contact_first_name"), e.get("contact_last_name")]))
+            itype = (e.get("interaction_type") or "note").capitalize()
+            stage = (e.get("opportunity_stage") or "").replace("_", " ").title()
+            val = f"${e.get('opportunity_value'):,.0f}" if e.get("opportunity_value") else ""
+            nxt = (e.get("next_steps") or "")[:50]
+
+            line = f"*{i}.* {itype} — *{acct}*"
+            if contact:
+                line += f" ({contact})"
+            if e.get("contact_title"):
+                line += f", {e['contact_title']}"
+            details = " | ".join(filter(None, [stage, val]))
+            if details:
+                line += f"\n   {details}"
+            if nxt:
+                line += f"\n   Next: {nxt}"
+            summary_lines.append(line)
+
+        if len(entities_list) > 10:
+            summary_lines.append(f"_...and {len(entities_list) - 10} more_")
+
+        summary_lines.append(f"\nType *yes* to save all {len(entities_list)} entries, or *cancel* to abort.")
+        await safe_reply(update, "\n".join(summary_lines))
         return
 
-    # ── Final confirmation — save everything ─────────────────────────────────
+    # ── Phase 2: Final save ──────────────────────────────────────────────────
     if lower in ["yes", "y", "save", "confirm", "go", "do it", "save all", "save all as new"]:
         saved = 0
         failed = 0
         for i, entities in enumerate(entities_list):
             raw = (
-                f"Bulk import entry {i+1}: "
+                f"Bulk import entry {i + 1}: "
                 f"{entities.get('account_name', '')} — "
                 f"{entities.get('interaction_summary', '')}"
             )
@@ -1221,23 +1391,23 @@ async def handle_bulk_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         conversation_state.pop(chat_id, None)
 
         unique_accounts = len(set(e.get("account_name", "") for e in entities_list if e.get("account_name")))
-        contacts_with_data = sum(
-            1 for e in entities_list
-            if e.get("contact_first_name") or e.get("contact_last_name")
-        )
-        opps_with_data = sum(1 for e in entities_list if e.get("opportunity_stage"))
+        contacts_created = sum(1 for e in entities_list if e.get("contact_first_name") or e.get("contact_last_name"))
+        opps_set = sum(1 for e in entities_list if e.get("opportunity_stage"))
+        tasks_set = sum(1 for e in entities_list if e.get("task_title"))
 
-        summary = (
-            f"✅ *Bulk import complete!*\n\n"
-            f"• {saved} interactions saved\n"
-            f"• {unique_accounts} accounts processed\n"
-            f"• {contacts_with_data} contacts processed\n"
-            f"• {opps_with_data} opportunities updated\n"
-        )
+        result_lines = [
+            "✅ *Bulk import complete!*\n",
+            f"• {saved} interactions saved",
+            f"• {unique_accounts} accounts processed",
+            f"• {contacts_created} contacts processed",
+            f"• {opps_set} opportunities updated",
+        ]
+        if tasks_set:
+            result_lines.append(f"• {tasks_set} tasks created")
         if failed:
-            summary += f"\n⚠️ {failed} entries failed — try re-entering those manually."
+            result_lines.append(f"\n⚠️ {failed} entries failed — try re-entering those manually.")
 
-        await update.message.reply_text(summary, parse_mode="Markdown")
+        await safe_reply(update, "\n".join(result_lines))
 
     else:
         await update.message.reply_text(
