@@ -22,15 +22,13 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 ALLOWED_CHAT_ID = int(os.environ["ALLOWED_CHAT_ID"])
 DAILY_BRIEFING_HOUR = int(os.environ.get("DAILY_BRIEFING_HOUR", "7"))
-EST = pytz.timezone("America/New_York")
+# Configurable timezone — set USER_TIMEZONE env var to change (default: America/New_York)
+TZ = pytz.timezone(os.environ.get("USER_TIMEZONE", "America/New_York"))
 
 # Messages longer than this are treated as bulk pastes
 BULK_THRESHOLD = 500
-
-# In-memory set of task IDs already alerted this session (avoids duplicate pings)
-alerted_task_ids: set[str] = set()
-# Tracks which event alert levels have fired: {event_id: {"30m", "5m"}}
-alerted_event_ids: dict[str, set] = {}
+# Alert state is persisted in Supabase (events.alerted_30m/5m, tasks.alerted_at)
+# No in-memory dedup needed — restarts are safe.
 
 # ─── Clients ──────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -203,7 +201,7 @@ Use when the user mentions a specific future time + who they're meeting.
 - Max 3 questions — keep them punchy
 - For BULK intent: extract everything you can; dedup is handled externally so don't add questions
 
-Today's date: """ + datetime.now(EST).strftime("%A, %B %d %Y") + """
+Today's date: """ + datetime.now(TZ).strftime("%A, %B %d %Y") + """
 """
 
 
@@ -891,7 +889,7 @@ def format_event_line(e: dict, now: datetime, show_date: bool = False) -> str:
     dur = e.get("duration_minutes", 30)
 
     try:
-        start = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(EST)
+        start = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(TZ)
         time_str = start.strftime("%I:%M %p").lstrip("0")
         if show_date:
             time_str = start.strftime("%a %b %-d ") + time_str
@@ -915,7 +913,7 @@ async def generate_pre_meeting_brief(event: dict, app: Application) -> str:
     try:
         acc_name = (event.get("accounts") or {}).get("name", "")
         db_ctx = get_crm_context(account_name=acc_name) if acc_name else get_crm_context()
-        start = datetime.fromisoformat(event["start_at"].replace("Z", "+00:00")).astimezone(EST)
+        start = datetime.fromisoformat(event["start_at"].replace("Z", "+00:00")).astimezone(TZ)
         prompt = (
             f"I have a {event.get('type','call')} — \"{event['title']}\" — starting at "
             f"{start.strftime('%I:%M %p')} ({event.get('duration_minutes',30)} min). "
@@ -932,57 +930,73 @@ async def generate_pre_meeting_brief(event: dict, app: Application) -> str:
 
 async def check_upcoming_events(app: Application):
     """
-    Runs every 5 minutes.
-    - 30 min before: sends full pre-meeting brief
-    - 5 min before:  sends a quick "starting soon" nudge
-    Uses alerted_event_ids dict to prevent duplicate alerts.
+    Runs every 5 minutes. Uses DB columns (alerted_30m / alerted_5m) as the
+    source of truth — restart-safe, no in-memory state needed.
+
+    - 30 min before: sends full pre-meeting brief  → sets alerted_30m = true
+    - 5 min before:  sends a quick nudge           → sets alerted_5m  = true
     """
     try:
-        now = datetime.now(EST)
+        now = datetime.now(TZ)
 
-        # Window: events starting in the next 35 minutes
-        window_end = (now + timedelta(minutes=35)).isoformat()
-        result = supabase.table("events").select(
-            "id, title, start_at, duration_minutes, type, location, accounts(name)"
-        ).gte("start_at", now.isoformat()).lte("start_at", window_end).execute()
+        # ── 30-minute briefs ──────────────────────────────────────────────────
+        # Events starting between 5 and 35 min from now that haven't been briefed
+        win30_lo = (now + timedelta(minutes=5)).isoformat()
+        win30_hi = (now + timedelta(minutes=35)).isoformat()
+        events_30 = supabase.table("events").select(
+            "id, title, start_at, duration_minutes, type, location, account_id, accounts(name)"
+        ).eq("alerted_30m", False).gte("start_at", win30_lo).lte("start_at", win30_hi).execute()
 
-        for e in (result.data or []):
-            eid = e["id"]
-            fired = alerted_event_ids.setdefault(eid, set())
+        for e in (events_30.data or []):
             try:
-                start = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(EST)
-                mins_away = (start - now).total_seconds() / 60
+                start = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(TZ)
+                mins_away = max(1, int((start - now).total_seconds() / 60))
             except Exception:
                 continue
 
-            acc = (e.get("accounts") or {}).get("name", "")
+            acc      = (e.get("accounts") or {}).get("name", "")
             time_str = start.strftime("%I:%M %p").lstrip("0")
 
-            # 30-minute warning with full brief
-            if mins_away <= 33 and "30m" not in fired:
-                fired.add("30m")
-                brief = await generate_pre_meeting_brief(e, app)
-                header = (
-                    f"📅 *{e['title']}* in ~30 min ({time_str})\n"
-                    + (f"Account: {acc}\n" if acc else "")
-                    + (f"📍 {e['location']}\n" if e.get("location") else "")
-                )
-                msg = header + ("\n" + brief if brief else "")
-                try:
-                    await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="Markdown")
-                except Exception:
-                    await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=re.sub(r"[*_`]", "", msg))
+            brief  = await generate_pre_meeting_brief(e, app)
+            header = (
+                f"📅 *{e['title']}* in ~{mins_away} min ({time_str})\n"
+                + (f"Account: {acc}\n" if acc else "")
+                + (f"📍 {e['location']}\n" if e.get("location") else "")
+            )
+            msg = header + ("\n" + brief if brief else "")
+            try:
+                await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="Markdown")
+            except Exception:
+                await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=re.sub(r"[*_`]", "", msg))
 
-            # 5-minute nudge
-            elif mins_away <= 7 and "5m" not in fired:
-                fired.add("5m")
-                nudge = f"⏰ *{e['title']}* starts in ~5 min"
-                if acc:
-                    nudge += f" — {acc}"
-                try:
-                    await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=nudge, parse_mode="Markdown")
-                except Exception:
-                    await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=re.sub(r"[*_`]", "", nudge))
+            # Mark as alerted in DB — survives restarts
+            supabase.table("events").update({"alerted_30m": True}).eq("id", e["id"]).execute()
+
+        # ── 5-minute nudges ───────────────────────────────────────────────────
+        # Events starting in the next 8 min that haven't been nudged
+        win5_hi = (now + timedelta(minutes=8)).isoformat()
+        events_5 = supabase.table("events").select(
+            "id, title, start_at, accounts(name)"
+        ).eq("alerted_5m", False).gte("start_at", now.isoformat()).lte("start_at", win5_hi).execute()
+
+        for e in (events_5.data or []):
+            try:
+                start    = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(TZ)
+                mins_away = max(1, int((start - now).total_seconds() / 60))
+            except Exception:
+                continue
+
+            acc   = (e.get("accounts") or {}).get("name", "")
+            nudge = f"⏰ *{e['title']}* starts in ~{mins_away} min"
+            if acc:
+                nudge += f" — {acc}"
+            try:
+                await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=nudge, parse_mode="Markdown")
+            except Exception:
+                await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=re.sub(r"[*_`]", "", nudge))
+
+            # Mark as nudged in DB
+            supabase.table("events").update({"alerted_5m": True}).eq("id", e["id"]).execute()
 
     except Exception as e:
         logger.error(f"Event check error: {e}")
@@ -997,7 +1011,7 @@ async def send_evening_digest(app: Application):
     • Prep reminder for tomorrow's first event
     """
     try:
-        now = datetime.now(EST)
+        now = datetime.now(TZ)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         tomorrow_start = today_start + timedelta(days=1)
         tomorrow_end = tomorrow_start + timedelta(days=1)
@@ -1064,7 +1078,7 @@ async def send_evening_digest(app: Application):
                 time_str = ""
                 if t.get("due_at"):
                     try:
-                        dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+                        dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(TZ)
                         time_str = f" by {dt.strftime('%I:%M %p').lstrip('0')}"
                     except Exception:
                         pass
@@ -1121,7 +1135,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 due_str = ""
                 if due_raw:
                     try:
-                        dt = datetime.fromisoformat(due_raw.replace("Z", "+00:00")).astimezone(EST)
+                        dt = datetime.fromisoformat(due_raw.replace("Z", "+00:00")).astimezone(TZ)
                         due_str = f" | {dt.strftime('%b %d')}"
                     except Exception:
                         pass
@@ -1170,7 +1184,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    now = datetime.now(EST)
+    now = datetime.now(TZ)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = day_start + timedelta(days=1)
 
@@ -1199,13 +1213,13 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = []
     for e in events:
         try:
-            t = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(EST)
+            t = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(TZ)
             items.append(("event", t, e))
         except Exception:
             pass
     for t in task_data:
         try:
-            dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+            dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(TZ)
             items.append(("task", dt, t))
         except Exception:
             pass
@@ -1244,7 +1258,7 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
-    now = datetime.now(EST)
+    now = datetime.now(TZ)
     # Show Mon–Sun of current week (or next 7 days if preferred)
     week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_end = week_start + timedelta(days=7)
@@ -1274,14 +1288,14 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for e in events:
         try:
-            dt = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(EST)
+            dt = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(TZ)
             day_key = dt.strftime("%Y-%m-%d")
             by_day[day_key].append(("event", dt, e))
         except Exception:
             pass
     for t in task_data:
         try:
-            dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+            dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(TZ)
             day_key = dt.strftime("%Y-%m-%d")
             by_day[day_key].append(("task", dt, t))
         except Exception:
@@ -1329,7 +1343,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ No pending tasks — you're all clear!")
             return
 
-        now = datetime.now(EST)
+        now = datetime.now(TZ)
         lines = ["📋 *Pending Tasks*\n"]
         for t in result.data:
             acc = (t.get("accounts") or {}).get("name", "")
@@ -1337,7 +1351,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             due_str = ""
             if due_raw:
                 try:
-                    due_dt = datetime.fromisoformat(due_raw.replace("Z", "+00:00")).astimezone(EST)
+                    due_dt = datetime.fromisoformat(due_raw.replace("Z", "+00:00")).astimezone(TZ)
                     if due_dt < now:
                         due_str = f"🔴 OVERDUE ({due_dt.strftime('%b %d')})"
                     elif due_dt.date() == now.date():
@@ -1442,7 +1456,7 @@ async def send_daily_briefing(app: Application):
     Sections: overdue tasks → due today → closing this week → stale deals → pipeline total.
     """
     try:
-        now = datetime.now(EST)
+        now = datetime.now(TZ)
         today_iso = now.date().isoformat()
         eod_iso = now.replace(hour=23, minute=59, second=59).isoformat()
         seven_days_iso = (now + timedelta(days=7)).date().isoformat()
@@ -1460,7 +1474,7 @@ async def send_daily_briefing(app: Application):
             for t in overdue.data[:6]:
                 acc = (t.get("accounts") or {}).get("name", "")
                 try:
-                    dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+                    dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(TZ)
                     age = f"since {dt.strftime('%b %d')}"
                 except Exception:
                     age = ""
@@ -1483,7 +1497,7 @@ async def send_daily_briefing(app: Application):
                 time_str = ""
                 if t.get("due_at"):
                     try:
-                        dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+                        dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(TZ)
                         time_str = f" at {dt.strftime('%I:%M %p')}"
                     except Exception:
                         pass
@@ -1577,36 +1591,33 @@ async def send_daily_briefing(app: Application):
 
 async def check_due_tasks(app: Application):
     """
-    Runs every 15 minutes. Sends an immediate Telegram alert for any task
-    due within the next 60 minutes, or overdue within the last 15 minutes.
-    Uses alerted_task_ids to avoid duplicate pings within a session.
+    Runs every 15 minutes. Alerts on tasks due within 60 min or overdue within 15 min.
+    Uses tasks.alerted_at (persisted in DB) — fully restart-safe, no in-memory state.
     """
     try:
-        now = datetime.now(EST)
-        window_start = (now - timedelta(minutes=15)).isoformat()
-        window_end = (now + timedelta(minutes=60)).isoformat()
+        now          = datetime.now(TZ)
+        window_start = (now - timedelta(minutes=15)).isoformat()   # catch recently-overdue
+        window_end   = (now + timedelta(minutes=60)).isoformat()   # look 60 min ahead
 
+        # Only fetch tasks that haven't been alerted yet (alerted_at IS NULL)
         tasks = supabase.table("tasks").select(
             "id, title, due_at, accounts(name)"
-        ).eq("completed", False).gte("due_at", window_start).lte("due_at", window_end).execute()
+        ).eq("completed", False).is_("alerted_at", "null").gte(
+            "due_at", window_start
+        ).lte("due_at", window_end).execute()
 
         for t in (tasks.data or []):
-            tid = t["id"]
-            if tid in alerted_task_ids:
-                continue
-            alerted_task_ids.add(tid)
-
             acc = (t.get("accounts") or {}).get("name", "")
             try:
-                due_dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
-                delta = (due_dt - now).total_seconds()
+                due_dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(TZ)
+                delta  = (due_dt - now).total_seconds()
                 if delta < 0:
                     timing = "🔴 *OVERDUE*"
                 elif delta < 3600:
-                    mins = max(1, int(delta / 60))
+                    mins   = max(1, int(delta / 60))
                     timing = f"⏰ *Due in {mins} min*"
                 else:
-                    timing = f"⏰ *Due at {due_dt.strftime('%I:%M %p')}*"
+                    timing = f"⏰ *Due at {due_dt.strftime('%I:%M %p').lstrip('0')}*"
             except Exception:
                 timing = "⏰ *Due soon*"
 
@@ -1614,11 +1625,23 @@ async def check_due_tasks(app: Application):
             if acc:
                 lines.append(f"Account: {acc}")
 
-            await app.bot.send_message(
-                chat_id=ALLOWED_CHAT_ID,
-                text="\n".join(lines),
-                parse_mode="Markdown"
-            )
+            try:
+                await app.bot.send_message(
+                    chat_id=ALLOWED_CHAT_ID,
+                    text="\n".join(lines),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                await app.bot.send_message(
+                    chat_id=ALLOWED_CHAT_ID,
+                    text=re.sub(r"[*_`]", "", "\n".join(lines))
+                )
+
+            # Stamp alerted_at in DB — prevents re-alert on restart
+            supabase.table("tasks").update(
+                {"alerted_at": now.isoformat()}
+            ).eq("id", t["id"]).execute()
+
     except Exception as e:
         logger.error(f"Due task check error: {e}")
 
@@ -1629,7 +1652,7 @@ async def check_close_dates(app: Application):
     Skips if no deals are closing soon (silent if nothing to report).
     """
     try:
-        now = datetime.now(EST)
+        now = datetime.now(TZ)
         today_iso = now.date().isoformat()
         seven_days_iso = (now + timedelta(days=7)).date().isoformat()
 
@@ -1669,6 +1692,80 @@ async def check_close_dates(app: Application):
         )
     except Exception as e:
         logger.error(f"Close date check error: {e}")
+
+
+async def check_stale_deals(app: Application):
+    """
+    Runs daily at 9:00am. Proactively pushes any open deal that has had
+    zero interactions in the past 14 days — separate from the morning briefing
+    so it arrives as its own actionable alert.
+    """
+    try:
+        now              = datetime.now(TZ)
+        fourteen_ago     = (now - timedelta(days=14)).isoformat()
+        open_stages      = ["prospecting", "qualified", "proposal", "negotiation"]
+
+        opps = supabase.table("opportunities").select(
+            "id, name, stage, value, account_id, accounts(name)"
+        ).in_("stage", open_stages).execute()
+
+        if not opps.data:
+            return
+
+        stale = []
+        for o in opps.data:
+            # Check whether any interaction exists for this account in the last 14 days
+            recent = supabase.table("interactions").select("id").eq(
+                "account_id", o["account_id"]
+            ).gte("created_at", fourteen_ago).limit(1).execute()
+
+            if not recent.data:
+                stale.append(o)
+
+        if not stale:
+            return
+
+        lines = [f"😴 *Stale deals — no activity in 14+ days:*\n"]
+        for o in stale:
+            acc   = (o.get("accounts") or {}).get("name", "?")
+            stage = (o.get("stage") or "").replace("_", " ").title()
+            val   = f"${o.get('value'):,.0f}" if o.get("value") else ""
+            detail = " | ".join(filter(None, [stage, val]))
+            lines.append(f"🔇 *{acc}* — {o.get('name', 'Deal')}")
+            if detail:
+                lines.append(f"   {detail}")
+
+        lines.append("\nLog an interaction or update the stage to keep your pipeline clean.")
+
+        try:
+            await app.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text="\n".join(lines),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            await app.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text=re.sub(r"[*_`]", "", "\n".join(lines))
+            )
+    except Exception as e:
+        logger.error(f"Stale deal check error: {e}")
+
+
+async def reset_event_alert_flags(app: Application):
+    """
+    Runs at midnight. Resets alerted_30m and alerted_5m for all events
+    that started more than 6 hours ago — so recurring events (daily standups,
+    weekly calls) will alert again the next time they appear.
+    """
+    try:
+        cutoff = (datetime.now(TZ) - timedelta(hours=6)).isoformat()
+        supabase.table("events").update(
+            {"alerted_30m": False, "alerted_5m": False}
+        ).lt("start_at", cutoff).execute()
+        logger.info("Midnight: reset event alert flags for past events.")
+    except Exception as e:
+        logger.error(f"Event flag reset error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2296,37 +2393,50 @@ def main():
         # 7:00am — full daily briefing (includes today's events)
         scheduler.add_job(
             send_daily_briefing, "cron",
-            hour=DAILY_BRIEFING_HOUR, minute=0, timezone=EST,
+            hour=DAILY_BRIEFING_HOUR, minute=0, timezone=TZ,
             args=[application], id="daily_briefing", replace_existing=True,
         )
         # 7:15am — deal close-date warnings
         scheduler.add_job(
             check_close_dates, "cron",
-            hour=DAILY_BRIEFING_HOUR, minute=15, timezone=EST,
+            hour=DAILY_BRIEFING_HOUR, minute=15, timezone=TZ,
             args=[application], id="close_date_check", replace_existing=True,
         )
         # 6:00pm — evening digest + tomorrow's schedule
         scheduler.add_job(
             send_evening_digest, "cron",
-            hour=18, minute=0, timezone=EST,
+            hour=18, minute=0, timezone=TZ,
             args=[application], id="evening_digest", replace_existing=True,
         )
-        # Every 15 min — task due-date alerts
+        # Every 15 min — task due-date alerts (DB-backed, restart-safe)
         scheduler.add_job(
             check_due_tasks, "interval",
             minutes=15, args=[application],
             id="task_due_check", replace_existing=True,
         )
-        # Every 5 min — pre-meeting event briefs (30 min + 5 min warnings)
+        # Every 5 min — pre-meeting event briefs (DB-backed, restart-safe)
         scheduler.add_job(
             check_upcoming_events, "interval",
             minutes=5, args=[application],
             id="event_check", replace_existing=True,
         )
+        # 9:00am daily — proactive stale deal push
+        scheduler.add_job(
+            check_stale_deals, "cron",
+            hour=9, minute=0, timezone=TZ,
+            args=[application], id="stale_deal_check", replace_existing=True,
+        )
+        # Midnight — reset event alert flags so recurring events re-alert tomorrow
+        scheduler.add_job(
+            reset_event_alert_flags, "cron",
+            hour=0, minute=1, timezone=TZ,
+            args=[application], id="event_flag_reset", replace_existing=True,
+        )
         scheduler.start()
         logger.info(
-            f"SalesFlow started. Morning briefing {DAILY_BRIEFING_HOUR}:00 EST, "
-            "evening digest 6:00pm. Task alerts every 15 min, event alerts every 5 min."
+            f"SalesFlow started. TZ={TZ}. Briefing {DAILY_BRIEFING_HOUR}:00, "
+            "stale-deal check 9:00, evening digest 18:00. "
+            "Task alerts every 15 min, event alerts every 5 min (DB-backed, restart-safe)."
         )
 
     app.post_init = post_init
