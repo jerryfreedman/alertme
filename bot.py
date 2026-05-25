@@ -28,8 +28,9 @@ EST = pytz.timezone("America/New_York")
 BULK_THRESHOLD = 500
 
 # In-memory set of task IDs already alerted this session (avoids duplicate pings)
-# Acceptable to reset on restart — worst case is one re-alert per task
 alerted_task_ids: set[str] = set()
+# Tracks which event alert levels have fired: {event_id: {"30m", "5m"}}
+alerted_event_ids: dict[str, set] = {}
 
 # ─── Clients ──────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -150,6 +151,24 @@ If a company had a call on Monday and a meeting on Thursday, that is TWO entitie
   "task_due_at": "ISO8601 or null",
   "account_name": "string or null",
   "confirmation": "✓ Reminder set: [task] — [date/time]"
+}
+
+### EVENT — Scheduling a calendar event (call, meeting, demo, review)
+Use when the user mentions a specific future time + who they're meeting.
+{
+  "intent": "EVENT",
+  "event": {
+    "title": "string",
+    "start_at": "ISO8601 with timezone offset",
+    "duration_minutes": number (default 30),
+    "type": "call|meeting|demo|review|other",
+    "account_name": "string or null",
+    "contact_first_name": "string or null",
+    "contact_last_name": "string or null",
+    "location": "string or null",
+    "notes": "string or null"
+  },
+  "confirmation": "📅 Scheduled: [title] — [day] at [time] ([duration] min). I'll brief you 30 min before."
 }
 
 ### DRAFT — Writing an email or message
@@ -817,6 +836,263 @@ def extract_account_hint(text: str) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CALENDAR HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_event_record(event_data: dict, account_id: str = None, contact_id: str = None, opportunity_id: str = None) -> str | None:
+    """Insert a new calendar event into Supabase. Returns the event id."""
+    try:
+        row = {
+            "title": event_data.get("title", "Untitled Event"),
+            "start_at": event_data.get("start_at"),
+            "duration_minutes": event_data.get("duration_minutes", 30),
+            "type": event_data.get("type", "call"),
+            "location": event_data.get("location"),
+            "notes": event_data.get("notes"),
+            "account_id": account_id,
+            "opportunity_id": opportunity_id,
+            "contact_ids": [contact_id] if contact_id else [],
+        }
+        # Compute end_at from start_at + duration
+        if row["start_at"] and row["duration_minutes"]:
+            try:
+                start = datetime.fromisoformat(row["start_at"].replace("Z", "+00:00"))
+                end = start + timedelta(minutes=row["duration_minutes"])
+                row["end_at"] = end.isoformat()
+            except Exception:
+                pass
+        result = supabase.table("events").insert(row).execute()
+        return result.data[0]["id"] if result.data else None
+    except Exception as e:
+        logger.error(f"Event create error: {e}")
+        return None
+
+
+def get_events_for_range(start: datetime, end: datetime) -> list[dict]:
+    """Fetch events between start and end, ordered by start_at."""
+    try:
+        result = supabase.table("events").select(
+            "id, title, start_at, end_at, duration_minutes, type, location, notes, "
+            "account_id, accounts(name)"
+        ).gte("start_at", start.isoformat()).lte("start_at", end.isoformat()).order("start_at").execute()
+        return result.data or []
+    except Exception as e:
+        logger.error(f"Event fetch error: {e}")
+        return []
+
+
+def format_event_line(e: dict, now: datetime, show_date: bool = False) -> str:
+    """Format a single event as a Telegram-ready line."""
+    type_emoji = {"call": "📞", "meeting": "🤝", "demo": "🖥", "review": "📋"}.get(
+        e.get("type", "call"), "📅"
+    )
+    acc = (e.get("accounts") or {}).get("name", "")
+    dur = e.get("duration_minutes", 30)
+
+    try:
+        start = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(EST)
+        time_str = start.strftime("%I:%M %p").lstrip("0")
+        if show_date:
+            time_str = start.strftime("%a %b %-d ") + time_str
+    except Exception:
+        time_str = "?"
+
+    line = f"{type_emoji} *{time_str}* — {e['title']}"
+    if acc:
+        line += f" | {acc}"
+    line += f" _({dur} min)_"
+    if e.get("location"):
+        line += f"\n   📍 {e['location']}"
+    return line
+
+
+async def generate_pre_meeting_brief(event: dict, app: Application) -> str:
+    """
+    Pull account + opportunity + interaction history for this event
+    and ask Claude to generate a punchy pre-meeting brief.
+    """
+    try:
+        acc_name = (event.get("accounts") or {}).get("name", "")
+        db_ctx = get_crm_context(account_name=acc_name) if acc_name else get_crm_context()
+        start = datetime.fromisoformat(event["start_at"].replace("Z", "+00:00")).astimezone(EST)
+        prompt = (
+            f"I have a {event.get('type','call')} — \"{event['title']}\" — starting at "
+            f"{start.strftime('%I:%M %p')} ({event.get('duration_minutes',30)} min). "
+            "Write a punchy pre-meeting brief using the CRM context below. "
+            "Include: deal status, last interaction summary, open tasks, key talking points, watch-outs. "
+            "Max 10 lines. Use bullet points. No fluff."
+        )
+        result = ask_claude(prompt, db_ctx)
+        return result.get("response", "No brief available — check account history manually.")
+    except Exception as e:
+        logger.error(f"Brief generation error: {e}")
+        return ""
+
+
+async def check_upcoming_events(app: Application):
+    """
+    Runs every 5 minutes.
+    - 30 min before: sends full pre-meeting brief
+    - 5 min before:  sends a quick "starting soon" nudge
+    Uses alerted_event_ids dict to prevent duplicate alerts.
+    """
+    try:
+        now = datetime.now(EST)
+
+        # Window: events starting in the next 35 minutes
+        window_end = (now + timedelta(minutes=35)).isoformat()
+        result = supabase.table("events").select(
+            "id, title, start_at, duration_minutes, type, location, accounts(name)"
+        ).gte("start_at", now.isoformat()).lte("start_at", window_end).execute()
+
+        for e in (result.data or []):
+            eid = e["id"]
+            fired = alerted_event_ids.setdefault(eid, set())
+            try:
+                start = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(EST)
+                mins_away = (start - now).total_seconds() / 60
+            except Exception:
+                continue
+
+            acc = (e.get("accounts") or {}).get("name", "")
+            time_str = start.strftime("%I:%M %p").lstrip("0")
+
+            # 30-minute warning with full brief
+            if mins_away <= 33 and "30m" not in fired:
+                fired.add("30m")
+                brief = await generate_pre_meeting_brief(e, app)
+                header = (
+                    f"📅 *{e['title']}* in ~30 min ({time_str})\n"
+                    + (f"Account: {acc}\n" if acc else "")
+                    + (f"📍 {e['location']}\n" if e.get("location") else "")
+                )
+                msg = header + ("\n" + brief if brief else "")
+                try:
+                    await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="Markdown")
+                except Exception:
+                    await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=re.sub(r"[*_`]", "", msg))
+
+            # 5-minute nudge
+            elif mins_away <= 7 and "5m" not in fired:
+                fired.add("5m")
+                nudge = f"⏰ *{e['title']}* starts in ~5 min"
+                if acc:
+                    nudge += f" — {acc}"
+                try:
+                    await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=nudge, parse_mode="Markdown")
+                except Exception:
+                    await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=re.sub(r"[*_`]", "", nudge))
+
+    except Exception as e:
+        logger.error(f"Event check error: {e}")
+
+
+async def send_evening_digest(app: Application):
+    """
+    6pm evening digest:
+    • What you logged today
+    • Tasks still open (overdue + due today)
+    • Tomorrow's full schedule with times
+    • Prep reminder for tomorrow's first event
+    """
+    try:
+        now = datetime.now(EST)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
+        tomorrow_end = tomorrow_start + timedelta(days=1)
+
+        sections = [f"🌆 *Evening Wrap — {now.strftime('%A, %B %d')}*\n"]
+
+        # ── What you logged today ────────────────────────────────────────────
+        logged = supabase.table("interactions").select(
+            "type, summary, accounts(name)"
+        ).gte("created_at", today_start.isoformat()).lte("created_at", now.isoformat()).execute()
+
+        if logged.data:
+            sections.append(f"📝 *Logged today ({len(logged.data)}):*")
+            for i in logged.data[:6]:
+                acc = (i.get("accounts") or {}).get("name", "")
+                itype = (i.get("type") or "note").capitalize()
+                summary = (i.get("summary") or "")[:60]
+                line = f"  • {itype}"
+                if acc:
+                    line += f" — {acc}"
+                if summary:
+                    line += f": {summary}"
+                sections.append(line)
+        else:
+            sections.append("📝 Nothing logged today yet")
+
+        # ── Still-open tasks ─────────────────────────────────────────────────
+        open_tasks = supabase.table("tasks").select(
+            "title, due_at, accounts(name)"
+        ).eq("completed", False).lte("due_at", now.isoformat() if True else "").execute()
+
+        # Actually get overdue + due today that are still open
+        still_open = supabase.table("tasks").select(
+            "title, due_at, accounts(name)"
+        ).eq("completed", False).lt("due_at", tomorrow_start.isoformat()).execute()
+
+        if still_open.data:
+            sections.append(f"\n⚠️ *Still open ({len(still_open.data)}):*")
+            for t in still_open.data[:5]:
+                acc = (t.get("accounts") or {}).get("name", "")
+                overdue = t.get("due_at", "") < now.isoformat()
+                flag = "🔴" if overdue else "🟡"
+                line = f"  {flag} {t['title']}"
+                if acc:
+                    line += f" — {acc}"
+                sections.append(line)
+
+        # ── Tomorrow's schedule ──────────────────────────────────────────────
+        tomorrow_events = get_events_for_range(tomorrow_start, tomorrow_end)
+        tomorrow_tasks = supabase.table("tasks").select(
+            "title, due_at, accounts(name)"
+        ).eq("completed", False).gte("due_at", tomorrow_start.isoformat()).lt(
+            "due_at", tomorrow_end.isoformat()
+        ).order("due_at").execute()
+
+        if tomorrow_events or (tomorrow_tasks.data):
+            sections.append(f"\n📅 *Tomorrow — {tomorrow_start.strftime('%A, %B %d')}:*")
+
+            for e in tomorrow_events:
+                sections.append("  " + format_event_line(e, now))
+
+            for t in (tomorrow_tasks.data or [])[:4]:
+                acc = (t.get("accounts") or {}).get("name", "")
+                time_str = ""
+                if t.get("due_at"):
+                    try:
+                        dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+                        time_str = f" by {dt.strftime('%I:%M %p').lstrip('0')}"
+                    except Exception:
+                        pass
+                line = f"  ✅ {t['title']}{time_str}"
+                if acc:
+                    line += f" — {acc}"
+                sections.append(line)
+        else:
+            sections.append("\n📅 *Tomorrow:* Nothing scheduled yet")
+
+        msg = "\n".join(sections)
+        if len(msg) > 4000:
+            msg = msg[:3997] + "…"
+
+        await app.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Evening digest error: {e}")
+        try:
+            await app.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text="⚠️ Evening digest failed — check Railway logs."
+            )
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SLASH COMMANDS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -886,6 +1162,148 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"/done error: {e}")
         await update.message.reply_text("Couldn't mark that task done — try again.")
+
+
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/today — today's full schedule: events in time order + tasks due today."""
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    now = datetime.now(EST)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+
+    events = get_events_for_range(day_start, day_end)
+    try:
+        tasks = supabase.table("tasks").select(
+            "title, due_at, accounts(name)"
+        ).eq("completed", False).gte("due_at", day_start.isoformat()).lt(
+            "due_at", day_end.isoformat()
+        ).order("due_at").execute()
+        task_data = tasks.data or []
+    except Exception:
+        task_data = []
+
+    if not events and not task_data:
+        await update.message.reply_text(
+            f"📅 *{now.strftime('%A, %B %d')}* — Nothing scheduled today.\n\n"
+            "_Add an event: \"Schedule a call with Sarah at Acme tomorrow at 2pm\"_",
+            parse_mode="Markdown"
+        )
+        return
+
+    lines = [f"📅 *{now.strftime('%A, %B %d')}*\n"]
+
+    # Merge events and tasks into a single time-sorted list
+    items = []
+    for e in events:
+        try:
+            t = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(EST)
+            items.append(("event", t, e))
+        except Exception:
+            pass
+    for t in task_data:
+        try:
+            dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+            items.append(("task", dt, t))
+        except Exception:
+            pass
+    items.sort(key=lambda x: x[1])
+
+    past, upcoming = [], []
+    for kind, dt, item in items:
+        (past if dt < now else upcoming).append((kind, dt, item))
+
+    if past:
+        lines.append("*Earlier today:*")
+        for kind, dt, item in past:
+            if kind == "event":
+                lines.append("  ✓ " + format_event_line(item, now).replace("*", ""))
+            else:
+                acc = (item.get("accounts") or {}).get("name", "")
+                lines.append(f"  ✓ {item['title']}" + (f" — {acc}" if acc else ""))
+        lines.append("")
+
+    if upcoming:
+        lines.append("*Coming up:*")
+        for kind, dt, item in upcoming:
+            if kind == "event":
+                lines.append("  " + format_event_line(item, now))
+            else:
+                acc = (item.get("accounts") or {}).get("name", "")
+                time_s = dt.strftime("%I:%M %p").lstrip("0")
+                lines.append(f"  ✅ *{time_s}* — {item['title']}" + (f" | {acc}" if acc else ""))
+
+    await safe_reply(update, "\n".join(lines))
+
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/week — this week's calendar: events and tasks grouped by day."""
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    now = datetime.now(EST)
+    # Show Mon–Sun of current week (or next 7 days if preferred)
+    week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_end = week_start + timedelta(days=7)
+
+    events = get_events_for_range(week_start, week_end)
+    try:
+        tasks = supabase.table("tasks").select(
+            "title, due_at, accounts(name)"
+        ).eq("completed", False).gte("due_at", week_start.isoformat()).lt(
+            "due_at", week_end.isoformat()
+        ).order("due_at").execute()
+        task_data = tasks.data or []
+    except Exception:
+        task_data = []
+
+    if not events and not task_data:
+        await update.message.reply_text(
+            "📆 Nothing on the calendar for the next 7 days.\n\n"
+            "_Add an event: \"Schedule a call with John at Globex Thursday at 3pm\"_",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Group by day
+    from collections import defaultdict
+    by_day: dict[str, list] = defaultdict(list)
+
+    for e in events:
+        try:
+            dt = datetime.fromisoformat(e["start_at"].replace("Z", "+00:00")).astimezone(EST)
+            day_key = dt.strftime("%Y-%m-%d")
+            by_day[day_key].append(("event", dt, e))
+        except Exception:
+            pass
+    for t in task_data:
+        try:
+            dt = datetime.fromisoformat(t["due_at"].replace("Z", "+00:00")).astimezone(EST)
+            day_key = dt.strftime("%Y-%m-%d")
+            by_day[day_key].append(("task", dt, t))
+        except Exception:
+            pass
+
+    lines = ["📆 *Next 7 Days*\n"]
+    for day_key in sorted(by_day.keys()):
+        items = sorted(by_day[day_key], key=lambda x: x[1])
+        day_dt = datetime.fromisoformat(day_key)
+        is_today = day_dt.date() == now.date()
+        day_label = ("*Today*" if is_today else f"*{day_dt.strftime('%A, %b %-d')}*")
+        lines.append(day_label)
+        for kind, dt, item in items:
+            if kind == "event":
+                lines.append("  " + format_event_line(item, now))
+            else:
+                acc = (item.get("accounts") or {}).get("name", "")
+                time_s = dt.strftime("%I:%M %p").lstrip("0")
+                lines.append(f"  ✅ *{time_s}* — {item['title']}" + (f" | {acc}" if acc else ""))
+        lines.append("")
+
+    await safe_reply(update, "\n".join(lines))
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1117,7 +1535,14 @@ async def send_daily_briefing(app: Application):
                 stage = (o.get("stage") or "").replace("_", " ").title()
                 sections.append(f"  • {acc} — {stage}")
 
-        # ── 5. Pipeline snapshot ─────────────────────────────────────────────
+        # ── 5. Today's calendar events ───────────────────────────────────────
+        todays_events = get_events_for_range(now, now.replace(hour=23, minute=59))
+        if todays_events:
+            sections.append(f"\n📅 *Today's Schedule ({len(todays_events)} events):*")
+            for e in todays_events:
+                sections.append("  " + format_event_line(e, now))
+
+        # ── 6. Pipeline snapshot ─────────────────────────────────────────────
         all_open = supabase.table("opportunities").select(
             "value, probability"
         ).not_.in_("stage", ["closed_won", "closed_lost"]).execute()
@@ -1400,6 +1825,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Task save error: {e}")
         await update.message.reply_text(result.get("confirmation", "✓ Reminder saved."), parse_mode="Markdown")
+
+    # ── EVENT ─────────────────────────────────────────────────────────────────
+    elif intent == "EVENT":
+        ev = result.get("event", {})
+        account_id = find_or_create_account(ev.get("account_name")) if ev.get("account_name") else None
+        contact_id = find_or_create_contact(
+            ev.get("contact_first_name"),
+            ev.get("contact_last_name"),
+            account_id,
+        ) if ev.get("contact_first_name") or ev.get("contact_last_name") else None
+        eid = create_event_record(ev, account_id=account_id, contact_id=contact_id)
+        msg = result.get("confirmation", "📅 Event scheduled.")
+        if not eid:
+            msg = "⚠️ Couldn't save the event — please try again."
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
     # ── DRAFT ─────────────────────────────────────────────────────────────────
     elif intent == "DRAFT":
@@ -1846,46 +2286,47 @@ def main():
     app.add_handler(CommandHandler("pipeline", cmd_pipeline))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler()
 
     async def post_init(application):
-        # 7am — full daily briefing
+        # 7:00am — full daily briefing (includes today's events)
         scheduler.add_job(
-            send_daily_briefing,
-            "cron",
-            hour=DAILY_BRIEFING_HOUR,
-            minute=0,
-            timezone=EST,
-            args=[application],
-            id="daily_briefing",
-            replace_existing=True,
+            send_daily_briefing, "cron",
+            hour=DAILY_BRIEFING_HOUR, minute=0, timezone=EST,
+            args=[application], id="daily_briefing", replace_existing=True,
         )
-        # 8am — deal close-date warnings (separate so they don't crowd the briefing)
+        # 7:15am — deal close-date warnings
         scheduler.add_job(
-            check_close_dates,
-            "cron",
-            hour=DAILY_BRIEFING_HOUR,
-            minute=15,
-            timezone=EST,
-            args=[application],
-            id="close_date_check",
-            replace_existing=True,
+            check_close_dates, "cron",
+            hour=DAILY_BRIEFING_HOUR, minute=15, timezone=EST,
+            args=[application], id="close_date_check", replace_existing=True,
         )
-        # Every 15 minutes — live task due-date alerts
+        # 6:00pm — evening digest + tomorrow's schedule
         scheduler.add_job(
-            check_due_tasks,
-            "interval",
-            minutes=15,
-            args=[application],
-            id="task_due_check",
-            replace_existing=True,
+            send_evening_digest, "cron",
+            hour=18, minute=0, timezone=EST,
+            args=[application], id="evening_digest", replace_existing=True,
+        )
+        # Every 15 min — task due-date alerts
+        scheduler.add_job(
+            check_due_tasks, "interval",
+            minutes=15, args=[application],
+            id="task_due_check", replace_existing=True,
+        )
+        # Every 5 min — pre-meeting event briefs (30 min + 5 min warnings)
+        scheduler.add_job(
+            check_upcoming_events, "interval",
+            minutes=5, args=[application],
+            id="event_check", replace_existing=True,
         )
         scheduler.start()
         logger.info(
-            f"SalesFlow started. Daily briefing at {DAILY_BRIEFING_HOUR}:00 EST. "
-            "Task alerts every 15 min."
+            f"SalesFlow started. Morning briefing {DAILY_BRIEFING_HOUR}:00 EST, "
+            "evening digest 6:00pm. Task alerts every 15 min, event alerts every 5 min."
         )
 
     app.post_init = post_init
