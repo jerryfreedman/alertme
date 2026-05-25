@@ -201,7 +201,10 @@ Use when the user mentions a specific future time + who they're meeting.
 - Max 3 questions — keep them punchy
 - For BULK intent: extract everything you can; dedup is handled externally so don't add questions
 
-Today's date: """ + datetime.now(TZ).strftime("%A, %B %d %Y") + """
+Today's date and time: """ + datetime.now(TZ).strftime("%A, %B %d %Y at %I:%M %p") + """
+User timezone: """ + str(TZ) + """ — ALL timestamps you generate (start_at, task_due_at, interaction_date)
+MUST include the UTC offset for this timezone. Example: "2024-01-16T14:00:00-05:00" for 2pm Eastern Standard
+Time or "2024-01-16T14:00:00-04:00" for 2pm Eastern Daylight Time. Never return a naive datetime (no offset).
 """
 
 
@@ -728,11 +731,11 @@ def store_complete_interaction(entities: dict, raw_text: str) -> bool:
 
         if entities.get("task_title"):
             supabase.table("tasks").insert({
-                "title": entities["task_title"],
-                "due_at": entities.get("task_due_at"),
-                "account_id": account_id,
+                "title":          entities["task_title"],
+                "due_at":         _normalize_timestamp(entities.get("task_due_at")),
+                "account_id":     account_id,
                 "opportunity_id": opportunity_id,
-                "contact_id": contact_id,
+                "contact_id":     contact_id,
             }).execute()
 
         return True
@@ -838,28 +841,52 @@ def extract_account_hint(text: str) -> str | None:
 # CALENDAR HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _normalize_timestamp(ts_str: str) -> str:
+    """
+    Parse a timestamp string from Claude and ensure it is timezone-aware.
+    If Claude returns a naive datetime (no UTC offset), assume it is in the
+    user's local timezone (TZ) and attach the correct offset before storing.
+    This prevents events from being silently stored as UTC when the user
+    meant local time, which would shift all alert windows by 4-5 hours.
+    """
+    if not ts_str:
+        return ts_str
+    try:
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # Naive datetime — Claude forgot the offset. Localize to user TZ.
+            dt = TZ.localize(dt)
+        return dt.isoformat()
+    except Exception:
+        return ts_str
+
+
 def create_event_record(event_data: dict, account_id: str = None, contact_id: str = None, opportunity_id: str = None) -> str | None:
     """Insert a new calendar event into Supabase. Returns the event id."""
     try:
+        # Normalize start_at — ensures timezone offset is always present
+        raw_start = _normalize_timestamp(event_data.get("start_at"))
+
         row = {
-            "title": event_data.get("title", "Untitled Event"),
-            "start_at": event_data.get("start_at"),
+            "title":            event_data.get("title", "Untitled Event"),
+            "start_at":         raw_start,
             "duration_minutes": event_data.get("duration_minutes", 30),
-            "type": event_data.get("type", "call"),
-            "location": event_data.get("location"),
-            "notes": event_data.get("notes"),
-            "account_id": account_id,
-            "opportunity_id": opportunity_id,
-            "contact_ids": [contact_id] if contact_id else [],
+            "type":             event_data.get("type", "call"),
+            "location":         event_data.get("location"),
+            "notes":            event_data.get("notes"),
+            "account_id":       account_id,
+            "opportunity_id":   opportunity_id,
+            "contact_ids":      [contact_id] if contact_id else [],
         }
-        # Compute end_at from start_at + duration
+        # Compute end_at from normalized start_at + duration
         if row["start_at"] and row["duration_minutes"]:
             try:
                 start = datetime.fromisoformat(row["start_at"].replace("Z", "+00:00"))
-                end = start + timedelta(minutes=row["duration_minutes"])
+                end   = start + timedelta(minutes=row["duration_minutes"])
                 row["end_at"] = end.isoformat()
             except Exception:
                 pass
+
         result = supabase.table("events").insert(row).execute()
         return result.data[0]["id"] if result.data else None
     except Exception as e:
@@ -1914,8 +1941,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if result.get("account_name") else None
             )
             supabase.table("tasks").insert({
-                "title": result.get("task_title", "Follow up"),
-                "due_at": result.get("task_due_at"),
+                "title":      result.get("task_title", "Follow up"),
+                "due_at":     _normalize_timestamp(result.get("task_due_at")),
                 "account_id": account_id,
             }).execute()
         except Exception as e:
