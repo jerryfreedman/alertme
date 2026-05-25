@@ -76,9 +76,13 @@ Extract all you can, then ask 2-3 targeted follow-up questions about what's miss
     "contact_first_name": "string or null",
     "contact_last_name": "string or null",
     "contact_title": "string or null",
+    "contact_email": "string or null",
+    "contact_phone": "string or null",
     "interaction_type": "call|email|meeting|note",
+    "interaction_date": "YYYY-MM-DD or null",
     "interaction_summary": "string or null",
     "next_steps": "string or null",
+    "opportunity_name": "string or null",
     "opportunity_stage": "string or null",
     "opportunity_value": number or null,
     "opportunity_close_date": "YYYY-MM-DD or null",
@@ -102,6 +106,8 @@ Extract all you can, then ask 2-3 targeted follow-up questions about what's miss
 
 ### BULK — Large paste containing multiple distinct interactions or accounts
 Use ONLY when the input clearly contains multiple separate interactions/accounts.
+IMPORTANT: Create ONE entity per distinct interaction event, not one per account.
+If a company had a call on Monday and a meeting on Thursday, that is TWO entities.
 {
   "intent": "BULK",
   "entities_list": [
@@ -110,9 +116,13 @@ Use ONLY when the input clearly contains multiple separate interactions/accounts
       "contact_first_name": "string or null",
       "contact_last_name": "string or null",
       "contact_title": "string or null",
+      "contact_email": "string or null",
+      "contact_phone": "string or null",
       "interaction_type": "call|email|meeting|note",
+      "interaction_date": "YYYY-MM-DD or null",
       "interaction_summary": "string",
       "next_steps": "string or null",
+      "opportunity_name": "string or null",
       "opportunity_stage": "string or null",
       "opportunity_value": number or null,
       "opportunity_close_date": "YYYY-MM-DD or null",
@@ -515,16 +525,25 @@ def find_or_create_account(name: str) -> str | None:
         return None
 
 
-def find_or_create_contact(first: str, last: str, account_id: str = None, title: str = None) -> str | None:
+def find_or_create_contact(
+    first: str,
+    last: str,
+    account_id: str = None,
+    title: str = None,
+    email: str = None,
+    phone: str = None,
+) -> str | None:
     """
     Find or create a contact, scoped to account_id when provided.
-    This prevents John Smith at Acme Corp from being linked to an interaction
-    at Globex Inc just because the names match.
+    - Searches within account first to prevent cross-account name collisions.
+    - Enriches an existing contact with email/phone if they were missing.
     """
     if not first and not last:
         return None
     try:
-        # Prefer an exact name match within the same account
+        existing_id = None
+
+        # Scoped search within account
         if account_id:
             q = supabase.table("contacts").select("id")
             if first:
@@ -533,10 +552,10 @@ def find_or_create_contact(first: str, last: str, account_id: str = None, title:
                 q = q.ilike("last_name", last)
             scoped = q.eq("account_id", account_id).execute()
             if scoped.data:
-                return scoped.data[0]["id"]
+                existing_id = scoped.data[0]["id"]
 
-        # Fall back to a global name match only if no account scoping applies
-        if not account_id:
+        # Global fallback if no account scope
+        if not existing_id and not account_id:
             q = supabase.table("contacts").select("id")
             if first:
                 q = q.ilike("first_name", first)
@@ -544,46 +563,102 @@ def find_or_create_contact(first: str, last: str, account_id: str = None, title:
                 q = q.ilike("last_name", last)
             result = q.execute()
             if result.data:
-                return result.data[0]["id"]
+                existing_id = result.data[0]["id"]
 
-        # Create new contact (linked to this account)
-        payload = {
+        if existing_id:
+            # Enrich existing contact with new email/phone/title if we have them
+            enrichment = {}
+            if email:
+                enrichment["email"] = email
+            if phone:
+                enrichment["phone"] = phone
+            if title:
+                enrichment["title"] = title
+            if enrichment:
+                supabase.table("contacts").update(enrichment).eq("id", existing_id).execute()
+            return existing_id
+
+        # Create new contact
+        payload: dict = {
             "first_name": first or "",
             "last_name": last or "",
             "account_id": account_id,
         }
         if title:
             payload["title"] = title
+        if email:
+            payload["email"] = email
+        if phone:
+            payload["phone"] = phone
         new = supabase.table("contacts").insert(payload).execute()
         return new.data[0]["id"] if new.data else None
+
     except Exception as e:
         logger.error(f"Contact upsert error: {e}")
         return None
 
 
 def find_or_update_opportunity(account_id: str, contact_id: str, entities: dict) -> str | None:
+    """
+    Find or create the right opportunity for this interaction.
+
+    Matching priority:
+    1. If opportunity_name provided → match by name within this account
+    2. If only ONE open opp exists for this account → update it (safe)
+    3. If MULTIPLE open opps exist and no name → log interaction without opp link
+       (prevents silently overwriting the wrong deal)
+    4. No open opps → create a new one with the provided name or a generated one
+    """
     if not account_id:
         return None
     try:
-        result = supabase.table("opportunities").select("id").eq(
+        opp_name = (
+            entities.get("opportunity_name")
+            or f"{entities.get('account_name', 'Deal')} Opportunity"
+        )
+        update_fields = {}
+        if entities.get("opportunity_stage"):
+            update_fields["stage"] = entities["opportunity_stage"]
+        if entities.get("opportunity_value"):
+            update_fields["value"] = entities["opportunity_value"]
+        if entities.get("opportunity_close_date"):
+            update_fields["close_date"] = entities["opportunity_close_date"]
+
+        # 1 — Exact name match within this account
+        if entities.get("opportunity_name"):
+            named = supabase.table("opportunities").select("id").eq(
+                "account_id", account_id
+            ).ilike("name", entities["opportunity_name"]).execute()
+            if named.data:
+                opp_id = named.data[0]["id"]
+                if update_fields:
+                    supabase.table("opportunities").update(update_fields).eq("id", opp_id).execute()
+                return opp_id
+
+        # 2/3 — Look at all open opportunities for this account
+        open_opps = supabase.table("opportunities").select("id, name").eq(
             "account_id", account_id
         ).not_.in_("stage", ["closed_won", "closed_lost"]).execute()
 
-        if result.data:
-            opp_id = result.data[0]["id"]
-            update = {}
-            if entities.get("opportunity_stage"):
-                update["stage"] = entities["opportunity_stage"]
-            if entities.get("opportunity_value"):
-                update["value"] = entities["opportunity_value"]
-            if entities.get("opportunity_close_date"):
-                update["close_date"] = entities["opportunity_close_date"]
-            if update:
-                supabase.table("opportunities").update(update).eq("id", opp_id).execute()
+        if len(open_opps.data) == 1:
+            # Exactly one open deal — safe to update
+            opp_id = open_opps.data[0]["id"]
+            if update_fields:
+                supabase.table("opportunities").update(update_fields).eq("id", opp_id).execute()
             return opp_id
 
+        if len(open_opps.data) > 1:
+            # Multiple open deals and no name to disambiguate —
+            # log the interaction without an opp link rather than corrupt the wrong deal
+            logger.warning(
+                f"Multiple open opps for account {account_id}, no opportunity_name given — "
+                "interaction saved without opportunity link"
+            )
+            return None
+
+        # 4 — No open opportunity → create one
         new = supabase.table("opportunities").insert({
-            "name": f"{entities.get('account_name', 'Deal')} Opportunity",
+            "name": opp_name,
             "account_id": account_id,
             "primary_contact_id": contact_id,
             "stage": entities.get("opportunity_stage", "prospecting"),
@@ -591,6 +666,7 @@ def find_or_update_opportunity(account_id: str, contact_id: str, entities: dict)
             "close_date": entities.get("opportunity_close_date"),
         }).execute()
         return new.data[0]["id"] if new.data else None
+
     except Exception as e:
         logger.error(f"Opportunity upsert error: {e}")
         return None
@@ -605,10 +681,12 @@ def store_complete_interaction(entities: dict, raw_text: str) -> bool:
             entities.get("contact_last_name"),
             account_id,
             entities.get("contact_title"),
+            entities.get("contact_email"),
+            entities.get("contact_phone"),
         )
         opportunity_id = find_or_update_opportunity(account_id, contact_id, entities)
 
-        supabase.table("interactions").insert({
+        interaction_row = {
             "type": entities.get("interaction_type", "note"),
             "raw_text": raw_text,
             "summary": entities.get("interaction_summary", ""),
@@ -616,7 +694,16 @@ def store_complete_interaction(entities: dict, raw_text: str) -> bool:
             "account_id": account_id,
             "opportunity_id": opportunity_id,
             "contact_ids": [contact_id] if contact_id else [],
-        }).execute()
+        }
+        # Preserve the historical date when provided (e.g. from bulk import)
+        if entities.get("interaction_date"):
+            try:
+                # Parse and store as timestamptz — keep time as midnight UTC if only date given
+                interaction_row["created_at"] = entities["interaction_date"] + "T00:00:00+00:00"
+            except Exception:
+                pass  # fall through to default now()
+
+        supabase.table("interactions").insert(interaction_row).execute()
 
         if entities.get("task_title"):
             supabase.table("tasks").insert({
