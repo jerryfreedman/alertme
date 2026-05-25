@@ -544,6 +544,36 @@ def ask_claude(user_message: str, db_context: str, extra_instructions: str = "")
         return {"intent": "GENERAL", "response": "Having trouble connecting right now. Try again in a moment."}
 
 
+async def safe_reply(update: Update, text: str) -> None:
+    """
+    Send a reply safely:
+    - Splits messages that exceed Telegram's 4096-char limit
+    - Falls back to plain text if Markdown causes a parse error
+      (happens when account names contain special chars like & . ( ) -)
+    """
+    MAX = 4000
+    # Split long text at newlines
+    chunks: list[str] = []
+    while text:
+        if len(text) <= MAX:
+            chunks.append(text)
+            break
+        split = text.rfind("\n", 0, MAX)
+        if split < 1:
+            split = MAX
+        chunks.append(text[:split])
+        text = text[split:].lstrip("\n")
+
+    for chunk in chunks:
+        try:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+        except Exception:
+            # Strip Markdown syntax and retry as plain text
+            clean = re.sub(r"[*_`]", "", chunk)
+            clean = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", clean)
+            await update.message.reply_text(clean)
+
+
 def format_questions(intro: str, questions: list[str]) -> str:
     """Format numbered questions as a clean Telegram message."""
     lines = [intro, ""]
@@ -574,6 +604,136 @@ def extract_account_hint(text: str) -> str | None:
         if m:
             return m.group(1).strip()
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLASH COMMANDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cancel — clear any active intake or disambiguation state."""
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    had_state = bool(conversation_state.pop(update.effective_chat.id, None))
+    msg = "↩️ Cancelled — ready for a fresh start." if had_state else "Nothing to cancel — all good!"
+    await update.message.reply_text(msg)
+
+
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tasks — list all pending (incomplete) tasks."""
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        result = supabase.table("tasks").select(
+            "title, due_at, accounts(name)"
+        ).eq("completed", False).order("due_at").execute()
+
+        if not result.data:
+            await update.message.reply_text("✅ No pending tasks — you're all clear!")
+            return
+
+        now = datetime.now(EST)
+        lines = ["📋 *Pending Tasks*\n"]
+        for t in result.data:
+            acc = (t.get("accounts") or {}).get("name", "")
+            due_raw = t.get("due_at") or ""
+            due_str = ""
+            if due_raw:
+                try:
+                    due_dt = datetime.fromisoformat(due_raw.replace("Z", "+00:00")).astimezone(EST)
+                    if due_dt < now:
+                        due_str = f"🔴 OVERDUE ({due_dt.strftime('%b %d')})"
+                    elif due_dt.date() == now.date():
+                        due_str = f"🟡 Today {due_dt.strftime('%I:%M %p')}"
+                    else:
+                        due_str = due_dt.strftime("%b %d")
+                except Exception:
+                    due_str = due_raw[:10]
+            line = f"• {t['title']}"
+            if acc:
+                line += f" — {acc}"
+            if due_str:
+                line += f" | {due_str}"
+            lines.append(line)
+
+        await safe_reply(update, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"/tasks error: {e}")
+        await update.message.reply_text("Couldn't fetch tasks right now.")
+
+
+async def cmd_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pipeline — show all open opportunities with stage and value."""
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        result = supabase.table("opportunities").select(
+            "name, stage, value, close_date, probability, accounts(name)"
+        ).not_.in_("stage", ["closed_won", "closed_lost"]).order("value", desc=True).execute()
+
+        if not result.data:
+            await update.message.reply_text("📭 No open opportunities yet.")
+            return
+
+        stage_emoji = {
+            "prospecting": "🔵", "qualified": "🟡",
+            "proposal": "🟠", "negotiation": "🔴",
+        }
+        total = sum(o.get("value") or 0 for o in result.data)
+        weighted = sum((o.get("value") or 0) * ((o.get("probability") or 0) / 100) for o in result.data)
+        lines = [
+            f"📊 *Open Pipeline*",
+            f"Total: ${total:,.0f}  |  Weighted: ${weighted:,.0f}\n",
+        ]
+        for o in result.data:
+            acc = (o.get("accounts") or {}).get("name", "Unknown")
+            stage = o.get("stage", "prospecting")
+            emoji = stage_emoji.get(stage, "⚪️")
+            val = f"${o.get('value'):,.0f}" if o.get("value") else "no value"
+            close = (o.get("close_date") or "")[:10]
+            prob = f"{o.get('probability')}%" if o.get("probability") else ""
+            detail = " | ".join(filter(None, [val, prob, f"Close: {close}" if close else ""]))
+            lines.append(f"{emoji} *{acc}* — {stage.replace('_', ' ').title()}")
+            lines.append(f"   {detail}")
+        await safe_reply(update, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"/pipeline error: {e}")
+        await update.message.reply_text("Couldn't fetch pipeline right now.")
+
+
+async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/accounts — list all accounts with open opportunity count."""
+    if update.effective_chat.id != ALLOWED_CHAT_ID:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        accounts = supabase.table("accounts").select("id, name, industry").order("name").execute()
+        if not accounts.data:
+            await update.message.reply_text("No accounts yet — log your first interaction to get started.")
+            return
+
+        # Get open opp counts per account
+        opps = supabase.table("opportunities").select(
+            "account_id"
+        ).not_.in_("stage", ["closed_won", "closed_lost"]).execute()
+        opp_counts: dict[str, int] = {}
+        for o in (opps.data or []):
+            aid = o["account_id"]
+            opp_counts[aid] = opp_counts.get(aid, 0) + 1
+
+        lines = [f"🏢 *Accounts ({len(accounts.data)})*\n"]
+        for a in accounts.data:
+            industry = f" ({a['industry']})" if a.get("industry") else ""
+            open_opps = opp_counts.get(a["id"], 0)
+            opp_note = f" | {open_opps} open opp{'s' if open_opps != 1 else ''}" if open_opps else ""
+            lines.append(f"• *{a['name']}*{industry}{opp_note}")
+
+        await safe_reply(update, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"/accounts error: {e}")
+        await update.message.reply_text("Couldn't fetch accounts right now.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -738,7 +898,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── QUERY ────────────────────────────────────────────────────────────────
     elif intent == "QUERY":
-        await update.message.reply_text(result.get("response", "No data found."), parse_mode="Markdown")
+        await safe_reply(update, result.get("response", "No data found."))
 
     # ── TASK ─────────────────────────────────────────────────────────────────
     elif intent == "TASK":
@@ -765,10 +925,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── GENERAL ──────────────────────────────────────────────────────────────
     else:
-        await update.message.reply_text(
-            result.get("response", "I'm not sure how to help with that."),
-            parse_mode="Markdown"
-        )
+        await safe_reply(update, result.get("response", "I'm not sure how to help with that."))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1148,6 +1305,10 @@ async def handle_disambiguation_choice(update: Update, context: ContextTypes.DEF
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("tasks", cmd_tasks))
+    app.add_handler(CommandHandler("pipeline", cmd_pipeline))
+    app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler()
